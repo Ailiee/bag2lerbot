@@ -1,0 +1,113 @@
+# ROS2 to LeRobot Converter Configuration Template
+# This YAML file defines the mapping between ROS2 topics and LeRobot dataset structure
+
+# Camera configuration
+# Each camera can have multiple topics (e.g., RGB, depth)
+cameras:
+  - camera_id: "camera_h"  # Unique identifier for the camera
+    topics:
+      - name: "/head/color/image_raw/compressed"  # ROS topic name
+        type: "sensor_msgs/CompressedImage"  # ROS message type
+        frequency: 60.0  # Expected frequency in Hz
+        compressed: true  # Whether the image is compressed
+        modality: "rgb"  # Image modality: rgb, depth, etc.
+      
+      # Example of depth camera topic
+      # - name: "/camera1/depth/image_rect_raw"
+      #   type: "sensor_msgs/Image"
+      #   frequency: 30.0
+      #   compressed: false
+      #   modality: "depth"
+
+  - camera_id: "camera_l"
+    topics:
+      - name: "/left/color/image_raw/compressed"
+        type: "sensor_msgs/CompressedImage"
+        frequency: 60.0
+        compressed: true
+        modality: "rgb"
+
+  # Add more cameras as needed
+  - camera_id: "camera_r"
+    topics:
+      - name: "/right/color/image_raw/compressed"
+        type: "sensor_msgs/CompressedImage"
+        frequency: 60.0
+        compressed: true
+        modality: "rgb"
+
+# Robot state configuration
+# Define topics that contain robot state and action information
+robot_state:
+  topics:
+    # Joint state topics
+    - name: "/left/ur5e/states"
+      type: "device_interfaces/msg/UrStates"
+      frequency: 100.0
+    
+    # End-effector state topics
+    - name: "/right/ur5e/states"
+      type: "device_interfaces/msg/UrStates"  # Example, actual type may vary
+      frequency: 100.0
+    
+    # Control command topics
+    - name: "/left/gripper/state"
+      type: "dh_gripper_driver/msg/GripperState"  # Example, actual type may vary
+      frequency: 100.0
+    
+    # Add more robot state topics as needed
+    - name: "/right/gripper/state"
+      type: "dh_gripper_driver/msg/GripperState"
+      frequency: 100.0
+  
+  # Define which data fields map to state vs action
+  # These will be implemented in custom message processors
+  state_fields:
+    - "joint_position"
+    - "end_eff"
+    - "gripper_position"
+  
+  action_fields:
+    - "joint_position"
+    - "end_eff"
+    - "gripper_position"
+
+# Synchronization settings
+synchronization:
+  # Maximum time difference in milliseconds for synchronization
+  tolerance_ms: 5000.0
+  
+  # Optional: specify a reference topic for synchronization
+  # If not specified, the topic with highest frequency will be used
+  # reference_topic: "/joint_states"
+
+# Output settings
+output:
+  # Number of frames per chunk in HDF5
+  chunk_size: 1000
+  
+  # Compression settings for HDF5
+  compression: "gzip"
+  compression_opts: 4  # Compression level (1-9)
+
+# Dataset metadata (optional)
+metadata:
+  # Task descriptions
+  tasks:
+    - "Pick and place object"
+  
+  # Robot information
+  robot:
+    name: "UR"
+    type: "6-DOF Manipulator"
+    gripper: "DH Gripper"
+  
+  # Environment information
+  environment:
+    name: "Lab Environment"
+    description: "Standard laboratory setting with table and objects"
+  
+  # Additional notes
+  notes: |
+    This dataset contains demonstrations of manipulation tasks
+    collected using teleoperation with visual feedback.
