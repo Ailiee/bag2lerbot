@@ -1243,66 +1243,6 @@ def main():
             pattern=args.pattern,
             message_processors=message_processors
         )
-        
-    elif args.mode == 'directory':
-        # Directory structure conversion
-        converter = ROS2ToLeRobotConverter(
-            config_path=Path(args.config),
-            output_base_dir=Path(args.output_dir)
-        )
-        
-        base_dir = Path(args.base_dir)
-        
-        # Find all subdirectories with bag data
-        bag_dirs = []
-        for subdir in base_dir.iterdir():
-            if subdir.is_dir():
-                # Check if it contains ROS bag data
-                record_dir = subdir / 'data' / 'record'
-                if record_dir.exists():
-                    # Find the actual bag directory
-                    for item in record_dir.iterdir():
-                        if item.is_dir() and (item / 'metadata.yaml').exists():
-                            bag_dirs.append(item)
-                            break
-                elif (subdir / 'metadata.yaml').exists():
-                    # Direct bag directory
-                    bag_dirs.append(subdir)
-        
-        if bag_dirs:
-            logger.info(f"Found {len(bag_dirs)} bag directories to process")
-            
-            # Generate dataset names from directory names
-            dataset_names = []
-            for bag_dir in bag_dirs:
-                # Use parent directories to create meaningful names
-                parts = []
-                current = bag_dir
-                for _ in range(3):  # Get up to 3 levels of directory names
-                    if current.parent != base_dir and current != base_dir:
-                        parts.append(current.name)
-                        current = current.parent
-                    else:
-                        break
-                
-                # Create name from parts
-                if parts:
-                    name = '_'.join(reversed(parts))
-                else:
-                    name = bag_dir.name
-                
-                # Clean the name
-                name = name.replace(' ', '_').replace('-', '_').replace('.', '_')
-                dataset_names.append(name)
-            
-            converter.convert_batch(
-                bag_paths=bag_dirs,
-                dataset_names=dataset_names,
-                message_processors=message_processors
-            )
-        else:
-            logger.warning(f"No ROS bag directories found in {base_dir}")
-
 
 if __name__ == "__main__":
     main()
