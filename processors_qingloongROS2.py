@@ -77,30 +77,20 @@ class ConfigProvider(MessageProcessor):
         config.robot_state = RobotStateConfig(
             topics=[
                 TopicConfig(
-                    name="/left/ur5e/states",
-                    type="device_interfaces/msg/UrStates",
-                    frequency=100.0
+                    name="/driver_pvt",
+                    type="driver_pvt/msg/DriverPVT",
+                    frequency=200.0
                 ),
                 TopicConfig(
-                    name="/right/ur5e/states",
-                    type="device_interfaces/msg/UrStates",
-                    frequency=100.0
+                    name="/end_pos",
+                    type="end_pos/msg/EndPos",
+                    frequency=200.0
                 ),
-                TopicConfig(
-                    name="/left/gripper/state",
-                    type="dh_gripper_driver/msg/GripperState",
-                    frequency=100.0
-                ),
-                TopicConfig(
-                    name="/right/gripper/state",
-                    type="dh_gripper_driver/msg/GripperState",
-                    frequency=100.0
-                )
             ]
         )
         
         # Synchronization settings
-        config.sync_tolerance_ms = 50.0
+        config.sync_tolerance_ms = 5000.0
         config.sync_reference = None  # Auto-select
         
         # Output settings
@@ -126,10 +116,10 @@ class ConfigProvider(MessageProcessor):
         
         # Method 1: Load from .msg files (优先)
         msg_files = {
-            'device_interfaces/msg/EEFPos': '/workspace/ur/ur_ws/src/device_interfaces/msg/EEFPos.msg',
-            'device_interfaces/msg/Joints': '/workspace/ur/ur_ws/src/device_interfaces/msg/Joints.msg',
-            'device_interfaces/msg/UrStates': '/workspace/ur/ur_ws/src/device_interfaces/msg/UrStates.msg',
-            'dh_gripper_driver/msg/GripperState': '/workspace/ur/ur_ws/src/dh_gripper_driver/msg/GripperState.msg',
+            'driver_pvt/msg/Joint': '/workspace/openloong2lerobot/qinglong_msg/Joint.msg',
+            'driver_pvt/msg/Limb': '/workspace/openloong2lerobot/qinglong_msg/Limb.msg',
+            'driver_pvt/msg/DriverPVT': '/workspace/openloong2lerobot/qinglong_msg/DriverPVT.msg',
+            'end_pos/msg/EndPos': '/workspace/openloong2lerobot/qinglong_msg/EndPos.msg',
             # 添加你的其他消息文件
             # 'driver_pvt/msg/Limb': 'src/driver_pvt/msg/Limb.msg',
             # 'driver_pvt/msg/Joint': 'src/driver_pvt/msg/Joint.msg',
@@ -169,7 +159,7 @@ class ConfigProvider(MessageProcessor):
         return [], []
 
 
-class UrStatesProcessor(MessageProcessor):
+class qingloongStatesProcessor(MessageProcessor):
     """Processor for device_interfaces/msg/UrStates messages."""
     
     def process(self, msg: Any, timestamp: int) -> Dict[str, Any]:
@@ -179,27 +169,34 @@ class UrStatesProcessor(MessageProcessor):
             'state': {},
             'action': {}
         }
-        
-        # Extract end-effector pose
-        if hasattr(msg, 'eef_pos') and hasattr(msg.eef_pos, 'positions'):
-            eef_positions = msg.eef_pos.positions
-            if len(eef_positions) == 6:
-                data['state']['end_eff'] = np.array(eef_positions[:6], dtype=np.float32)
-
-        # Extract joint angles
-        if hasattr(msg, 'joints') and hasattr(msg.joints, 'angles'):
-            data['state']['joint_positions'] = np.array(msg.joints.angles, dtype=np.float32)
+        # Extract joint pose
+        q_pos = []
+        q_pos_exp = []
+        if hasattr(msg, 'limbs'):
+            limb_list = msg.limbs
+            for limb_idx in range(2,8):
+                limb = limb_list[limb_idx]
+                for joint in limb.joints:
+                    q_pos.append(joint.q)
+                    q_pos_exp.append(joint.q_exp)
+            # 修正
+            if q_pos[-1] > 90.0:
+                q_pos[-1] = 0.0
+            if q_pos[-2] > 90.0:
+                q_pos[-2] = 0.0
+            data['state']['q_pos'] = np.array(q_pos, dtype=np.float32)
+            data['action']['q_pos'] = np.array(q_pos_exp, dtype=np.float32)
             
         return data
 
     def get_state_action_mapping(self) -> Tuple[List[str], List[str]]:
         """Return the mapping of data fields to state and action."""
-        state_fields = ['end_eff', 'joint_position']
-        action_fields = []
+        state_fields = ['q_pos']
+        action_fields = ['q_pos']
         return state_fields, action_fields
 
 
-class GripperStateProcessor(MessageProcessor):
+class qingloongEEFProcessor(MessageProcessor):
     """Processor for dh_gripper_driver/msg/GripperState messages."""
     
     def process(self, msg: Any, timestamp: int) -> Dict[str, Any]:
@@ -211,19 +208,31 @@ class GripperStateProcessor(MessageProcessor):
         }
         
         # State information
-        if hasattr(msg, 'position'):
-            data['state']['gripper_position'] = float(msg.position)
+        if hasattr(msg, 'ee_pose_l') and hasattr(msg, 'ee_pose_r'):
+            data['state']['eef'] = np.concatenate(
+                (
+                    np.asarray(msg.ee_pose_l[:6], dtype=np.float32),
+                    np.asarray(msg.ee_pose_r[:6], dtype=np.float32),
+                ),
+                axis=0,
+            )
 
         # Action information
-        if hasattr(msg, 'target_position'):
-            data['action']['gripper_position'] = float(msg.target_position)
+        if hasattr(msg, 'ee_pose_l_exp') and hasattr(msg, 'ee_pose_r_exp'):
+            data['action']['eef'] = np.concatenate(
+                (
+                    np.asarray(msg.ee_pose_l_exp[:6], dtype=np.float32),
+                    np.asarray(msg.ee_pose_r_exp[:6], dtype=np.float32),
+                ),
+                axis=0,
+                )
 
         return data
 
     def get_state_action_mapping(self) -> Tuple[List[str], List[str]]:
         """Return the mapping of data fields to state and action."""
-        state_fields = ['gripper_position']
-        action_fields = ['gripper_position']
+        state_fields = ['eef']
+        action_fields = ['eef']
         return state_fields, action_fields
 
 
@@ -239,8 +248,8 @@ def get_message_processors() -> Dict[str, MessageProcessor]:
         'ConfigProvider': ConfigProvider(),
         
         # Custom processors for UR and Gripper
-        'UrStates': UrStatesProcessor(),
-        'GripperState': GripperStateProcessor(),
+        'DriverPVT': qingloongStatesProcessor(),
+        'EndPos': qingloongEEFProcessor(),
     }
     
     return processors
