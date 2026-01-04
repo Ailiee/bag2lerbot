@@ -54,6 +54,11 @@ def combine_state(components: Dict[str, np.ndarray]) -> np.ndarray:
     if "end/eef" in components:
         eef = components["end/eef"]
         
+    if joints[-1] > 90.0:
+        joints[-1] = 0.0
+    if joints[-2] > 90.0:
+        joints[-2] = 0.0
+        
     state_parts.append(joints[:14])  # Ensure 14 joints
     state_parts.append(eef[:12])  # Ensure 12 joints
     state_parts.append(joints[14:])

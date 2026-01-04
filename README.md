@@ -44,9 +44,9 @@ python ros2_to_lerobot_converter.py batch \
 
 ```bash
 python ros2_to_lerobot_converter.py batch \
-    --bags-dir=/media/aliee5/QL_ros2/20251121 \
-    --output-dir=/media/aliee5/QL_ros2/20251121Out \
-    --custom-processor=/workspace/openloong2lerobot/processors_qingloongROS2.py
+    --bags-dir=/workspace/rawdata \
+    --output-dir=/workspace/rawdata1 \
+    --custom-processor=/workspace/code/bag2lerbot/processors_qingloongROS2.py
 ```
 
 ### 第二步：转换为 LeRobot 数据集 (Synced to LeRobot Dataset)
@@ -73,14 +73,14 @@ python synced_to_lerobot_converter.py \
 
 ```bash
 python synced_to_lerobot_converter.py \
-    --input-dir /media/aliee5/QL_ros2/20251121OUT \
-    --output-dir /media/aliee5/QL_ros2/qingloong_Foldingclothes_20251121 \
-    --repo-id qingloong_Foldingclothes_20251121 \
+    --input-dir /workspace/rawdata1 \
+    --output-dir /workspace/qingloong_Foldingclothes_20251231 \
+    --repo-id qingloong_Foldingclothes_20251231 \
     --fps=30 \
     --robot-type=qingloongROS2  \
-    --mapping-file=/workspace/openloong2lerobot/custom_state_action_mapping_qingloongROS2.py \
+    --mapping-file=/workspace/code/bag2lerbot/custom_state_action_mapping_qingloongROS2.py \
     --use-hardware-encoding \
-    --vcodec libsvtav1 \
+    --vcodec h264_nvenc \
     --crf 30 \
     --batch-size 4
 ```
@@ -91,12 +91,12 @@ python synced_to_lerobot_converter.py \
 
 ```bash
 python synced_to_lerobot_converter.py \
-    --input-dir /media/aliee5/QL_ros2/20251121Out \
-    --output-dir /media/aliee5/QL_ros2/qingloong_Foldingclothes_20251121 \
-    --repo-id qingloong_Foldingclothes_20251121 \
+    --input-dir /workspace/rawdata1 \
+    --output-dir /workspace/qingloong_Foldingclothes_20251231 \
+    --repo-id qingloong_Foldingclothes_20251231 \
     --fps=30 \
     --robot-type=qingloongROS2  \
-    --mapping-file=/workspace/openloong2lerobot/custom_state_action_mapping_qingloongROS2.py \
+    --mapping-file=/workspace/code/bag2lerbot/custom_state_action_mapping_qingloongROS2.py \
     --use-hardware-encoding \
     --vcodec av1_nvenc \
     --crf 25 \

@@ -116,13 +116,10 @@ class ConfigProvider(MessageProcessor):
         
         # Method 1: Load from .msg files (优先)
         msg_files = {
-            'driver_pvt/msg/Joint': '/workspace/openloong2lerobot/qinglong_msg/Joint.msg',
-            'driver_pvt/msg/Limb': '/workspace/openloong2lerobot/qinglong_msg/Limb.msg',
-            'driver_pvt/msg/DriverPVT': '/workspace/openloong2lerobot/qinglong_msg/DriverPVT.msg',
-            'end_pos/msg/EndPos': '/workspace/openloong2lerobot/qinglong_msg/EndPos.msg',
-            # 添加你的其他消息文件
-            # 'driver_pvt/msg/Limb': 'src/driver_pvt/msg/Limb.msg',
-            # 'driver_pvt/msg/Joint': 'src/driver_pvt/msg/Joint.msg',
+            'driver_pvt/msg/Joint': '/workspace/code/bag2lerbot/qinglong_msg/Joint.msg',
+            'driver_pvt/msg/Limb': '/workspace/code/bag2lerbot/qinglong_msg/Limb.msg',
+            'driver_pvt/msg/DriverPVT': '/workspace/code/bag2lerbot/qinglong_msg/DriverPVT.msg',
+            'end_pos/msg/EndPos': '/workspace/code/bag2lerbot/qinglong_msg/EndPos.msg',
         }
         
         add_types = {}
@@ -169,6 +166,7 @@ class qingloongStatesProcessor(MessageProcessor):
             'state': {},
             'action': {}
         }
+        data['timestamp'] = msg.timestamp.sec * 10**9 + msg.timestamp.nanosec
         # Extract joint pose
         q_pos = []
         q_pos_exp = []
@@ -206,7 +204,7 @@ class qingloongEEFProcessor(MessageProcessor):
             'state': {},
             'action': {}
         }
-        
+        data['timestamp'] = msg.timestamp.sec * 10**9 + msg.timestamp.nanosec
         # State information
         if hasattr(msg, 'ee_pose_l') and hasattr(msg, 'ee_pose_r'):
             data['state']['eef'] = np.concatenate(
