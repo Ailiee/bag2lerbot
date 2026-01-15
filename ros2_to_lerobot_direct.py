@@ -901,6 +901,11 @@ if __name__ == "__main__":
         print(f"Merge Complete! Final dataset at: {output_root}")
         print(f"Total Frames: {merged.meta.total_frames}")
 
+        # Cleanup temporary episodes once final dataset is ready
+        if separate_dir.exists():
+            shutil.rmtree(separate_dir)
+            print("Removed temporary _separate_episodes directory.")
+
     # Cleanup separate (Optional: ask user)
     # shutil.rmtree(separate_dir)
 
