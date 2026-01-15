@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-ROS2 to LeRobot 3.0 Converter - Final Optimized Version
+ROS2 to LeRobot 3.0 Converter - Minimal Worker Optimization
 
-Changes from original:
-1. Use rosbags instead of rosbag2_py (faster)
-2. Remove config.yaml dependency (integrated into processor)
-3. Add image topic validation
-4. Simplify code structure
+Changes:
+1. Add --workers parameter to control parallel workers
+2. Optimize default worker count from CPU_COUNT/2 to 16
 """
 
 from __future__ import annotations
@@ -105,15 +103,24 @@ class ImageProcessor:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.frame_counters: Dict[str, int] = {}
         
+    def _extract_header_timestamp(self, msg: Any) -> Optional[int]:
+        """Extract timestamp from message header if available."""
+        if hasattr(msg, 'header') and hasattr(msg.header, 'stamp'):
+            stamp = msg.header.stamp
+            return stamp.sec * 10**9 + stamp.nanosec
+        return None
+        
     def process_compressed_image(self, msg: Any, timestamp: int, camera_id: str, modality: str) -> Dict[str, Any]:
+        actual_timestamp = self._extract_header_timestamp(msg) or timestamp
+        
         np_arr = np.frombuffer(msg.data, np.uint8)
         img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         if img is None:
             return {}
         if modality == 'rgb':
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        image_path = self._save_image(img, timestamp, camera_id, modality)
-        return {'timestamp': timestamp, 'path': str(image_path), 'shape': img.shape, 'dtype': str(img.dtype)}
+        image_path = self._save_image(img, actual_timestamp, camera_id, modality)
+        return {'timestamp': actual_timestamp, 'path': str(image_path), 'shape': img.shape, 'dtype': str(img.dtype)}
     
     def process_raw_image(self, msg: Any, timestamp: int, camera_id: str, modality: str) -> Dict[str, Any]:
         try:
@@ -205,7 +212,7 @@ class DataExtractor:
                     continue
                 
                 try:
-                    msg = deserialize_cdr(rawdata, connection.msgtype, typestore)
+                    msg = typestore.deserialize_cdr(rawdata, connection.msgtype)
                 except Exception:
                     continue
                 
@@ -218,7 +225,7 @@ class DataExtractor:
                     self.data_streams[stream_name].append(processed_data)
                     
                     # 修改开始：优先使用 processed_data 中的 timestamp (例如来自消息 Header)
-                    # 如果没有，则回退使用 bag 录制时间戳
+                    # 如果没有,则回退使用 bag 录制时间戳
                     actual_timestamp = processed_data.get('timestamp', timestamp)
                     self.timestamps[stream_name].append(actual_timestamp)
                     # 修改结束
@@ -476,14 +483,25 @@ class ROS2ToLeRobotConverter:
         
         return output_dir
     
-    def convert_batch(self, bag_paths: List[Path], dataset_names: Optional[List[str]] = None) -> List[Path]:
+    def convert_batch(self, bag_paths: List[Path], dataset_names: Optional[List[str]] = None, 
+                     max_workers: int = 16) -> List[Path]:
+        """
+        Convert multiple bags in parallel.
+        
+        Args:
+            bag_paths: List of bag paths to convert
+            dataset_names: Optional list of dataset names
+            max_workers: Number of parallel workers (default: 16)
+                        - Recommended: 8-16 for HDD, 16-24 for SSD
+        """
         if dataset_names and len(dataset_names) != len(bag_paths):
             raise ValueError("Mismatch between bag paths and dataset names")
         dataset_names = dataset_names or [f"episode_{i:04d}" for i in range(len(bag_paths))]
         
         output_dirs = []
         failed_bags = []
-        max_workers = min(len(bag_paths), max(1, os.cpu_count()//2 or 1))
+        # Cap workers by number of bags
+        max_workers = min(len(bag_paths), max_workers)
         
         print(f"\n{'='*80}")
         print(f"Starting conversion: {len(bag_paths)} bags | {max_workers} parallel workers")
@@ -520,12 +538,21 @@ class ROS2ToLeRobotConverter:
         
         return output_dirs
     
-    def convert_directory(self, bags_directory: Path, pattern: str = "*.db3") -> List[Path]:
+    def convert_directory(self, bags_directory: Path, pattern: str = "*.mcap", 
+                         max_workers: int = 16) -> List[Path]:
+        """
+        Convert all bags in a directory.
+        
+        Args:
+            bags_directory: Directory containing bag folders
+            pattern: Bag file pattern (default: "*.mcap")
+            max_workers: Number of parallel workers (default: 16)
+        """
         bags_directory = Path(bags_directory)
         bag_paths, dataset_names = [], []
         
         for episode_dir in sorted(p for p in bags_directory.iterdir() if p.is_dir()):
-            raw_data_dir = episode_dir / "data" / "record" / "raw_data"
+            raw_data_dir = episode_dir / "record" / "raw_data"
             bag_path = None
             
             if raw_data_dir.is_dir():
@@ -547,7 +574,7 @@ class ROS2ToLeRobotConverter:
             return []
         
         logger.info(f"Found {len(bag_paths)} ROS bags")
-        return self.convert_batch(bag_paths, dataset_names)
+        return self.convert_batch(bag_paths, dataset_names, max_workers=max_workers)
 
 
 def main():
@@ -564,6 +591,8 @@ def main():
     batch_parser.add_argument("--bags-dir", required=True)
     batch_parser.add_argument("--output-dir", required=True)
     batch_parser.add_argument("--custom-processor", required=True)
+    batch_parser.add_argument("--workers", type=int, default=16, 
+                            help="Number of parallel workers (default: 16, recommended: 8-24 depending on disk speed)")
     
     args = parser.parse_args()
     if not args.mode:
@@ -581,7 +610,7 @@ def main():
         converter.convert_single(Path(args.bag), args.dataset_name)
     elif args.mode == 'batch':
         converter = ROS2ToLeRobotConverter(Path(args.output_dir), message_processors)
-        converter.convert_directory(Path(args.bags_dir))
+        converter.convert_directory(Path(args.bags_dir), max_workers=args.workers)
 
 if __name__ == "__main__":
     main()

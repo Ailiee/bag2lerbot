@@ -48,15 +48,31 @@ def combine_state(components: Dict[str, np.ndarray]) -> np.ndarray:
     state_parts = []
     
     # Left arm joints (6 DOF for UR5e)
+    joints = None
+    eef = None
+    
     if "driver/q_pos" in components:
         joints = components["driver/q_pos"]
     # Right arm joints (6 DOF for UR5e)
     if "end/eef" in components:
         eef = components["end/eef"]
         
-    state_parts.append(joints[:14])  # Ensure 14 joints
-    state_parts.append(eef[:12])  # Ensure 12 joints
-    state_parts.append(joints[14:])
+    if joints is not None:
+        state_parts.append(joints[:14])  # Ensure 14 joints
+        
+    if eef is not None:
+        state_parts.append(eef[:12])  # Ensure 12 joints
+        
+    if joints is not None and eef is None:
+        # Fallback if only joints available? Or raise error?
+        pass
+
+    if joints is not None:
+        state_parts.append(joints[14:])
+        
+    if not state_parts:
+        raise ValueError("No state components found (missing driver/q_pos and end/eef)")
+        
     # Concatenate all parts
     # Total: 7 + 7 + 6 + 6 + 3 + 2 + 2 = 33 dimensions
     return np.concatenate(state_parts, axis=-1).astype(np.float32)
@@ -77,16 +93,27 @@ def combine_action(components: Dict[str, np.ndarray]) -> np.ndarray:
     action_parts = []
     
     # Left arm joint commands (6 DOF)
+    joints = None
+    eef = None
+    
     if "driver/q_pos" in components:
         joints = components["driver/q_pos"]
 
     # Right arm joint commands (6 DOF)
     if "end/eef" in components:
         eef = components["end/eef"]
+    
+    if joints is not None:
+        action_parts.append(joints[:14])  # Ensure 14 joints
         
-    action_parts.append(joints[:14])  # Ensure 14 joints
-    action_parts.append(eef[:12])  # Ensure 12 joints
-    action_parts.append(joints[14:])
+    if eef is not None:
+        action_parts.append(eef[:12])  # Ensure 12 joints
+        
+    if joints is not None:
+        action_parts.append(joints[14:])
+        
+    if not action_parts:
+        raise ValueError("No action components found")
       
     # Concatenate all parts
     # Total: 7 + 7 + 6 + 6 + 3 + 2 + 2 = 33 dimensions

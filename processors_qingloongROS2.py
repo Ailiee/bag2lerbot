@@ -107,22 +107,29 @@ class ConfigProvider(MessageProcessor):
     def register_custom_types(self, reader: Any, typestore: Any) -> None:
         """
         Register custom ROS2 message types.
-        
-        Method 1: Load from .msg files (if you have source)
-        Method 2: Load from bag (fallback)
         """
         from pathlib import Path
         from rosbags.typesys import get_types_from_msg
         
-        # Method 1: Load from .msg files (优先)
+        # Method 1: Load from bag (PRIORITY: Matches the data exactly)
+        connections = reader.connections
+        connections_list = connections.values() if isinstance(connections, dict) else connections
+        
+        for connection in connections_list:
+            try:
+                if connection.msgdef and connection.msgtype:
+                    # Provide the type definition from the bag itself
+                    typestore.register(get_types_from_msg(connection.msgdef, connection.msgtype))
+            except Exception:
+                # If already registered or invalid, ignore
+                pass
+
+        # Method 2: Load from .msg files (FALLBACK / SUPPLEMENT)
         msg_files = {
             'driver_pvt/msg/Joint': '/workspace/openloong2lerobot/qinglong_msg/Joint.msg',
             'driver_pvt/msg/Limb': '/workspace/openloong2lerobot/qinglong_msg/Limb.msg',
             'driver_pvt/msg/DriverPVT': '/workspace/openloong2lerobot/qinglong_msg/DriverPVT.msg',
             'end_pos/msg/EndPos': '/workspace/openloong2lerobot/qinglong_msg/EndPos.msg',
-            # 添加你的其他消息文件
-            # 'driver_pvt/msg/Limb': 'src/driver_pvt/msg/Limb.msg',
-            # 'driver_pvt/msg/Joint': 'src/driver_pvt/msg/Joint.msg',
         }
         
         add_types = {}
@@ -132,23 +139,14 @@ class ConfigProvider(MessageProcessor):
                 try:
                     msg_text = msg_file.read_text()
                     add_types.update(get_types_from_msg(msg_text, name=msg_name))
-                except Exception as e:
-                    pass  # 如果文件不存在，使用方法2
+                except Exception:
+                    pass
         
-        # 注册从文件加载的类型
         if add_types:
-            typestore.register(add_types)
-            # print(f"✓ Registered: {list(add_types.keys())}")
-
-        # Method 2: Load from bag (fallback - 如果没有.msg文件)
-        connections = reader.connections
-        connections_list = connections.values() if isinstance(connections, dict) else connections
-        
-        for connection in connections_list:
             try:
-                typestore.register(connection.msgdef)
+                typestore.register(add_types)
             except Exception:
-                pass  # 已经注册过
+                pass
     
     def process(self, msg: Any, timestamp: int) -> Dict[str, Any]:
         """Not used - this is a config provider only."""
@@ -169,6 +167,7 @@ class qingloongStatesProcessor(MessageProcessor):
             'state': {},
             'action': {}
         }
+        data['timestamp'] = msg.timestamp.sec * 10**9 + msg.timestamp.nanosec
         # Extract joint pose
         q_pos = []
         q_pos_exp = []
@@ -206,7 +205,7 @@ class qingloongEEFProcessor(MessageProcessor):
             'state': {},
             'action': {}
         }
-        
+        data['timestamp'] = msg.timestamp.sec * 10**9 + msg.timestamp.nanosec
         # State information
         if hasattr(msg, 'ee_pose_l') and hasattr(msg, 'ee_pose_r'):
             data['state']['eef'] = np.concatenate(
