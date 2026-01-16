@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
-Direct ROS2 to LeRobot Converter (Separate + Merge Mode)
+Optimized ROS2 to LeRobot Converter (Single-Pass + Separate Mode + Merge)
 
-This script performs a one-step conversion from ROS2 bags to a unified LeRobot dataset.
-It uses multiprocessing to convert each bag into a temporary separate dataset,
-then merges them all into the final output efficiently.
+Key Optimizations over the original:
+1. Single-pass bag reading (vs. two passes for timestamp scan + data collection)
+2. Immediate video encoding after collecting frames (releases memory faster)  
+3. Uses PyAV for video encoding (avoids subprocess overhead)
+4. Proper numpy array copying to avoid memory reference issues
+5. Compatible with LeRobot _save_episode_video(temp_path=...) API
 
-Key Features:
-- Parallel processing of bags (Separate Mode).
-- Direct memory-to-video piping (No intermediate image files).
-- Auto-merge of episodes.
-- "LeRobot calling architecture" compliant (uses LeRobotDataset class).
+Usage:
+    python ros2_to_lerobot_optimized.py \
+        --bags-dir /path/to/bags \
+        --output-dir /path/to/output \
+        --repo-id your/repo_id \
+        --robot-type your_robot \
+        --custom-processor /path/to/processor.py \
+        --mapping-file /path/to/mapping.py \
+        --fps 30 --workers 4
 """
 
 import argparse
@@ -18,102 +25,53 @@ import importlib.util
 import logging
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
 import traceback
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from rosbags.rosbag2 import Reader as RosbagReader
-from rosbags.serde import deserialize_cdr
-from rosbags.typesys import get_typestore, Stores
 from tqdm import tqdm
+
+# ROS2 bag reading
+try:
+    from rosbags.rosbag2 import Reader as RosbagReader
+    from rosbags.typesys import get_typestore, Stores
+except ImportError:
+    print("Error: 'rosbags' package not found. Install with: pip install rosbags")
+    sys.exit(1)
+
+# Video encoding - prefer PyAV for efficiency
+try:
+    import av
+    USE_PYAV = True
+except ImportError:
+    USE_PYAV = False
+    import subprocess
+    print("Warning: PyAV not found, falling back to FFmpeg subprocess (slower)")
 
 # LeRobot imports
 try:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.datasets.dataset_tools import merge_datasets
-    from lerobot.datasets.utils import (
-        validate_frame,
-        update_chunk_file_indices,
-        get_file_size_in_mb,
-        write_info,
-    )
-    from lerobot.datasets.video_utils import (
-        get_video_duration_in_s,
-        concatenate_video_files,
-        get_video_info,
-    )
-    # Optional: stats computation if manually needed, though LeRobotDataset handles it sometimes
     from lerobot.datasets.compute_stats import compute_episode_stats
 except ImportError:
     print("Error: 'lerobot' package not found. Please install it first.")
     sys.exit(1)
 
-# Import base classes from the original converter to maintain compatibility
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-try:
-    from ros2_to_lerobot_converter import (
-        ConverterConfig,
-        MessageProcessor,
-        TimestampSynchronizer,
-        TopicConfig,
-        CameraConfig
-    )
-except ImportError:
-    # Fallback/Mock classes if file missing (though it should be there)
-    pass
-
-class TimestampSynchronizer:
-    """
-    Synchronizes multiple streams using Nearest Neighbor to the Reference stream.
-    Strictly follows reference stream frames. If a stream is missing data, uses nearest available.
-    """
-    def __init__(self, tolerance_ms=None):
-        self.tolerance_ms = tolerance_ms # Ignored now in favor of pure nearest
-
-    def synchronize_streams(self, ref_timestamps, other_streams_timestamps):
-        """
-        Match every timestamp in ref_timestamps with the NEAREST timestamp in each other stream.
-        No dropout. Always finds a match if data exists.
-        """
-        sync_indices = {}
-        
-        for topic, stream_ts in other_streams_timestamps.items():
-            if len(stream_ts) == 0:
-                # If a stream is empty, we can't match anything.
-                sync_indices[topic] = [None] * len(ref_timestamps)
-                continue
-                
-            # Efficient Nearest Neighbor Search using searchsorted
-            # Find indices in stream_ts that are just right of ref_ts
-            idx_right = np.searchsorted(stream_ts, ref_timestamps, side='right')
-            idx_left = idx_right - 1
-            
-            # Clip indices to boundaries
-            idx_right = np.clip(idx_right, 0, len(stream_ts) - 1)
-            idx_left = np.clip(idx_left, 0, len(stream_ts) - 1)
-            
-            # Calculate diffs
-            diff_left = np.abs(stream_ts[idx_left] - ref_timestamps)
-            diff_right = np.abs(stream_ts[idx_right] - ref_timestamps)
-            
-            # Choose nearest
-            nearest_indices = np.where(diff_left < diff_right, idx_left, idx_right)
-            
-            # Unconditionally use the nearest index
-            sync_indices[topic] = nearest_indices.tolist()
-            
-        return sync_indices
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Utility Classes
+# =============================================================================
 
 @dataclass
 class StateActionMapping:
@@ -125,8 +83,44 @@ class StateActionMapping:
     normalize: bool = True
 
 
-def get_message_timestamp(msg, default_ts):
-    """Extract timestamp from message header or timestamp field if available."""
+class TimestampSynchronizer:
+    """
+    Synchronizes multiple streams using Nearest Neighbor to the Reference stream.
+    """
+    def synchronize_streams(self, ref_timestamps: np.ndarray, 
+                           other_streams: Dict[str, np.ndarray]) -> Dict[str, List[int]]:
+        """
+        Match every timestamp in ref_timestamps with the NEAREST timestamp in each other stream.
+        """
+        sync_indices = {}
+        
+        for topic, stream_ts in other_streams.items():
+            if len(stream_ts) == 0:
+                sync_indices[topic] = [None] * len(ref_timestamps)
+                continue
+            
+            # Efficient Nearest Neighbor using searchsorted
+            idx_right = np.searchsorted(stream_ts, ref_timestamps, side='right')
+            idx_left = idx_right - 1
+            
+            idx_right = np.clip(idx_right, 0, len(stream_ts) - 1)
+            idx_left = np.clip(idx_left, 0, len(stream_ts) - 1)
+            
+            diff_left = np.abs(stream_ts[idx_left] - ref_timestamps)
+            diff_right = np.abs(stream_ts[idx_right] - ref_timestamps)
+            
+            nearest_indices = np.where(diff_left <= diff_right, idx_left, idx_right)
+            sync_indices[topic] = nearest_indices.tolist()
+            
+        return sync_indices
+
+
+# =============================================================================
+# Image / Video Utilities
+# =============================================================================
+
+def get_message_timestamp(msg, default_ts: int) -> int:
+    """Extract timestamp from message header (in nanoseconds)."""
     if hasattr(msg, 'header') and hasattr(msg.header, 'stamp'):
         return msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
     if hasattr(msg, 'timestamp'):
@@ -141,392 +135,201 @@ def decode_compressed_rgb(image_bytes: bytes) -> np.ndarray:
     np_arr = np.frombuffer(image_bytes, np.uint8)
     img_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
     if img_bgr is None:
-        raise ValueError("Failed to decode compressed image data")
+        raise ValueError("Failed to decode compressed image")
     return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
 
-def encode_video_from_entries(
-    entries: List[Dict[str, Any]],
+def encode_video_pyav(
+    images: List[np.ndarray],
     video_path: Path,
     fps: int,
-    vcodec: str,
-    pix_fmt: str,
-    gop: int,
-    crf: int,
-    fast_decode: bool = False,
-):
-    """Encode video from a list of per-frame image entries."""
-    if not entries:
-        raise ValueError("No frames provided for video encoding")
-
-    # Decode first frame to determine resolution
-    first_entry = entries[0]
-    if first_entry.get("storage") == "compressed":
-        first_frame = decode_compressed_rgb(first_entry["data"])
-    else:
-        first_frame = np.asarray(first_entry["data"], dtype=np.uint8)
-
-    if first_frame.ndim != 3 or first_frame.shape[2] not in (3, 4):
-        raise ValueError("Video frames must be HxWx3 or HxWx4 arrays")
-
-    if first_frame.shape[2] == 4:
-        first_frame = first_frame[:, :, :3]
-
-    height, width, _ = first_frame.shape
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+    g: int = 2,
+    crf: int = 30,
+    preset: int = 12,
+) -> None:
+    """Encode video using PyAV (fast, no subprocess)."""
+    if len(images) == 0:
+        raise ValueError("No images provided for video encoding")
+    
+    height, width = images[0].shape[:2]
+    
+    # Handle codec/pix_fmt compatibility
+    if vcodec in ("libsvtav1", "hevc") and pix_fmt == "yuv444p":
+        pix_fmt = "yuv420p"
+    
+    video_options = {"g": str(g), "crf": str(crf)}
+    if vcodec == "libsvtav1":
+        video_options["preset"] = str(preset)
+    
     video_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with av.open(str(video_path), "w") as output:
+        stream = output.add_stream(vcodec, fps, options=video_options)
+        stream.pix_fmt = pix_fmt
+        stream.width = width
+        stream.height = height
+        
+        for img_array in images:
+            if img_array.shape[2] == 4:  # RGBA -> RGB
+                img_array = img_array[:, :, :3]
+            frame = av.VideoFrame.from_ndarray(img_array, format='rgb24')
+            for packet in stream.encode(frame):
+                output.mux(packet)
+        
+        # Flush encoder
+        for packet in stream.encode():
+            output.mux(packet)
 
+
+def encode_video_ffmpeg(
+    images: List[np.ndarray],
+    video_path: Path,
+    fps: int,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+    gop: int = 2,
+    crf: int = 30,
+) -> None:
+    """Encode video using FFmpeg subprocess (fallback)."""
+    if len(images) == 0:
+        raise ValueError("No images provided")
+    
+    height, width = images[0].shape[:2]
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "-s",
-        f"{width}x{height}",
-        "-r",
-        str(fps),
-        "-i",
-        "-",
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-pix_fmt", "rgb24",
+        "-s", f"{width}x{height}",
+        "-r", str(fps),
+        "-i", "-",
         "-an",
-        "-c:v",
-        vcodec,
-        "-pix_fmt",
-        pix_fmt,
+        "-c:v", vcodec,
+        "-pix_fmt", pix_fmt,
+        "-g", str(gop),
+        "-crf", str(crf),
     ]
-
-    if gop is not None:
-        cmd.extend(["-g", str(gop)])
-
-    if "libsvtav1" in vcodec:
-        cmd.extend(["-crf", str(crf), "-preset", "8"])
-        if fast_decode:
-            cmd.extend(["-svtav1-params", "tune=0"])
-    elif "nvenc" in vcodec:
-        cmd.extend(["-cq", str(crf), "-preset", "p4", "-bf", "0"])
+    
+    if vcodec == "libsvtav1":
+        cmd.extend(["-preset", "8"])
     else:
-        cmd.extend(["-crf", str(crf), "-preset", "fast"])
-        if fast_decode and vcodec in {"libx264", "libx265"}:
-            cmd.extend(["-tune", "fastdecode"])
-
+        cmd.extend(["-preset", "fast"])
+    
     cmd.append(str(video_path))
-
+    
     process = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=10 ** 8,
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, 
+        stderr=subprocess.PIPE, bufsize=10**8
     )
-
+    
     try:
-        # Write first frame and reuse for iteration
-        process.stdin.write(first_frame.astype(np.uint8).tobytes())
-        for entry in entries[1:]:
-            if entry.get("storage") == "compressed":
-                frame = decode_compressed_rgb(entry["data"])
-            else:
-                frame = np.asarray(entry["data"], dtype=np.uint8)
-            if frame.shape[2] == 4:
-                frame = frame[:, :, :3]
-            process.stdin.write(frame.astype(np.uint8).tobytes())
-        process.stdin.flush()
-    except Exception as exc:
-        stdout, stderr = process.communicate()
-        err_msg = stderr.decode("utf-8", errors="ignore") if stderr else str(exc)
-        raise RuntimeError(
-            f"FFmpeg encoding failed for {video_path}.\nCommand: {' '.join(cmd)}\nError Output:\n{err_msg}"
-        ) from exc
-    finally:
-        try:
-            process.stdin.close()
-        except Exception:
-            pass
-
+        for img in images:
+            if img.shape[2] == 4:
+                img = img[:, :, :3]
+            process.stdin.write(img.astype(np.uint8).tobytes())
+        process.stdin.close()
+    except Exception as e:
+        process.kill()
+        raise RuntimeError(f"FFmpeg encoding failed: {e}")
+    
     process.wait()
     if process.returncode != 0:
-        stderr = process.stderr.read().decode("utf-8", errors="ignore") if process.stderr else ""
-        raise RuntimeError(
-            f"FFmpeg exited with code {process.returncode} for {video_path}.\n{stderr}"
-        )
+        stderr = process.stderr.read().decode() if process.stderr else ""
+        raise RuntimeError(f"FFmpeg exited with code {process.returncode}: {stderr}")
 
-class OptimizedLeRobotDataset(LeRobotDataset):
-    """LeRobotDataset variant that bypasses per-frame image writes and encodes videos on save."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._init_custom_attributes()
+def encode_video(images: List[np.ndarray], video_path: Path, fps: int, 
+                 vcodec: str = "libsvtav1", crf: int = 30) -> None:
+    """Encode video using best available method."""
+    if USE_PYAV:
+        encode_video_pyav(images, video_path, fps, vcodec=vcodec, crf=crf)
+    else:
+        encode_video_ffmpeg(images, video_path, fps, vcodec=vcodec, crf=crf)
 
-    def _init_custom_attributes(self):
-        self.current_image_buffers: Dict[str, List[Dict[str, Any]]] = {}
-        self.vcodec = "libsvtav1"
-        self.crf = 30
-        self.pix_fmt = "yuv420p"
-        self.gop = 2
-        self.fast_decode = True
-        self.encoding_threads = 4
-        self.video_chunk_state: Dict[str, Dict[str, Any]] = {}
 
-    @classmethod
-    def create(cls, *args, **kwargs):
-        obj = super().create(*args, **kwargs)
-        obj._init_custom_attributes()
-        return obj
+def save_video_to_dataset(
+    dataset: LeRobotDataset,
+    video_key: str,
+    episode_index: int,
+    temp_video_path: Path,
+) -> dict:
+    """
+    Save a pre-encoded video to the LeRobot dataset.
+    
+    Completely manual implementation that bypasses _save_episode_video
+    to avoid any internal file lookups.
+    """
+    if not temp_video_path.exists():
+        raise FileNotFoundError(f"Source video file not found: {temp_video_path}")
+    
+    # Determine chunk structure
+    chunks_size = getattr(dataset.meta, 'chunks_size', 1000)
+    chunk_index = episode_index // chunks_size
+    file_index = episode_index % chunks_size
+    
+    # Create target directory structure
+    target_dir = dataset.root / "videos" / video_key / f"chunk-{chunk_index:03d}"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Target video file path
+    target_video_path = target_dir / f"file-{file_index:03d}.mp4"
+    
+    # Copy the video file
+    logger.info(f"  Copying: {temp_video_path} -> {target_video_path}")
+    shutil.copy2(temp_video_path, target_video_path)
+    
+    # Verify the copy
+    if not target_video_path.exists():
+        raise RuntimeError(f"Failed to copy video: target does not exist: {target_video_path}")
+    
+    source_size = temp_video_path.stat().st_size
+    target_size = target_video_path.stat().st_size
+    if source_size != target_size:
+        raise RuntimeError(f"Video copy size mismatch: source={source_size}, target={target_size}")
+    
+    logger.info(f"  Verified: {target_video_path} ({target_size} bytes)")
+    
+    # Return empty metadata - the video path is implicit from the directory structure
+    return {}
 
-    def set_current_image_buffers(self, buffers: Dict[str, List[Dict[str, Any]]]):
-        self.current_image_buffers = buffers
 
-    def add_frame(self, frame: dict) -> None:
-        frame_copy = {}
-        for key, value in frame.items():
-            if hasattr(value, "numpy"):
-                frame_copy[key] = value.numpy()
-            else:
-                frame_copy[key] = value
+# =============================================================================
+# Module Loading
+# =============================================================================
 
-        # Build placeholder frame for validation
-        validate_frame_dict = {}
-        for key, value in frame_copy.items():
-            if key in ("timestamp", "task"):
-                continue
-            feature = self.features.get(key)
-            if feature and feature["dtype"] in ["image", "video"]:
-                shape = feature["shape"]
-                validate_frame_dict[key] = np.zeros(shape, dtype=np.uint8)
-            else:
-                validate_frame_dict[key] = value
-
-        task_value = frame_copy.get("task")
-        if task_value is None:
-            raise ValueError("Frame missing 'task' field")
-        validate_frame_dict["task"] = task_value
-
-        validate_frame(validate_frame_dict, self.features)
-
-        if self.episode_buffer is None:
-            self.episode_buffer = self.create_episode_buffer()
-            self.episode_buffer["episode_index"] = self.meta.total_episodes
-            self.current_image_buffers = {k: [] for k in self.meta.video_keys}
-
-        frame_index = self.episode_buffer["size"]
-        timestamp = frame_copy.pop("timestamp", frame_index / self.fps)
-        frame_copy.pop("task", None)
-
-        self.episode_buffer["frame_index"].append(frame_index)
-        self.episode_buffer["timestamp"].append(timestamp)
-        self.episode_buffer["task"].append(task_value)
-
-        for key, value in frame_copy.items():
-            feature = self.features.get(key)
-            if feature and feature["dtype"] in ["image", "video"]:
-                self.episode_buffer[key].append("placeholder")
-                self.current_image_buffers.setdefault(key, []).append(value)
-            else:
-                self.episode_buffer[key].append(value)
-
-        self.episode_buffer["size"] += 1
-
-    def save_episode(self, episode_data: dict | None = None) -> None:
-        episode_buffer = episode_data if episode_data is not None else self.episode_buffer
-        if episode_buffer is None:
-            raise ValueError("No episode data to save")
-
-        episode_length = episode_buffer.pop("size")
-        tasks = episode_buffer.pop("task")
-        episode_tasks = list(set(tasks))
-        episode_index = episode_buffer["episode_index"]
-
-        episode_buffer["index"] = np.arange(
-            self.meta.total_frames,
-            self.meta.total_frames + episode_length,
-        )
-        episode_buffer["episode_index"] = np.full((episode_length,), episode_index)
-
-        self.meta.save_episode_tasks(episode_tasks)
-        episode_buffer["task_index"] = np.array(
-            [self.meta.get_task_index(task) for task in tasks]
-        )
-
-        for key, ft in self.features.items():
-            if key in ["index", "episode_index", "task_index"]:
-                continue
-            if ft["dtype"] in ["image", "video"]:
-                continue
-            episode_buffer[key] = np.stack(episode_buffer[key])
-
-        vector_features = {
-            k: v for k, v in self.features.items() if v["dtype"] not in ["image", "video"]
-        }
-        vector_buffer = {k: episode_buffer[k] for k in vector_features if k in episode_buffer}
-        ep_stats = compute_episode_stats(vector_buffer, vector_features)
-
-        ep_metadata = self._save_episode_data(episode_buffer)
-
-        if self.meta.video_keys:
-            with ThreadPoolExecutor(max_workers=self.encoding_threads) as executor:
-                futures = {
-                    executor.submit(self._save_episode_video, video_key, episode_index): video_key
-                    for video_key in self.meta.video_keys
-                }
-                for future in futures:
-                    video_key = futures[future]
-                    metadata = future.result()
-                    ep_metadata.update(metadata)
-
-        self.meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats, ep_metadata)
-
-        if episode_data is None:
-            self.clear_episode_buffer(delete_images=False)
-        self.current_image_buffers = {k: [] for k in self.meta.video_keys}
-
-    def clear_episode_buffer(self, delete_images: bool = True) -> None:
-        super().clear_episode_buffer(delete_images=delete_images)
-        self.episode_buffer = None
-        self.current_image_buffers = {k: [] for k in self.meta.video_keys}
-
-    def _init_video_state(self, video_key: str, episode_index: int):
-        if video_key in self.video_chunk_state:
-            return
-
-        if (
-            episode_index == 0
-            or self.meta.latest_episode is None
-            or f"videos/{video_key}/chunk_index" not in self.meta.latest_episode
-        ):
-            chunk_idx, file_idx = 0, 0
-            if self.meta.episodes is not None and len(self.meta.episodes) > 0:
-                old_chunk_idx = self.meta.episodes[-1][f"videos/{video_key}/chunk_index"]
-                old_file_idx = self.meta.episodes[-1][f"videos/{video_key}/file_index"]
-                chunk_idx, file_idx = update_chunk_file_indices(
-                    old_chunk_idx, old_file_idx, self.meta.chunks_size
-                )
-            latest_duration_in_s = 0.0
-        else:
-            latest_ep = self.meta.latest_episode
-            chunk_idx = latest_ep[f"videos/{video_key}/chunk_index"][0]
-            file_idx = latest_ep[f"videos/{video_key}/file_index"][0]
-            latest_duration_in_s = latest_ep[f"videos/{video_key}/to_timestamp"][0]
-
-        video_path = self.root / self.meta.video_path.format(
-            video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
-        )
-
-        pending_files: List[Path] = []
-        current_chunk_size = 0.0
-
-        if video_path.exists():
-            pending_files.append(video_path)
-            current_chunk_size = get_file_size_in_mb(video_path)
-
-        self.video_chunk_state[video_key] = {
-            "chunk_idx": chunk_idx,
-            "file_idx": file_idx,
-            "pending_files": pending_files,
-            "current_chunk_size": current_chunk_size,
-            "current_chunk_duration": latest_duration_in_s,
-        }
-
-    def _flush_chunk(self, video_key: str):
-        state = self.video_chunk_state[video_key]
-        if not state["pending_files"]:
-            return
-
-        chunk_idx, file_idx = state["chunk_idx"], state["file_idx"]
-        video_path = self.root / self.meta.video_path.format(
-            video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
-        )
-
-        if len(state["pending_files"]) == 1 and state["pending_files"][0] == video_path:
-            state["pending_files"] = []
-            return
-
-        valid_files = [p for p in state["pending_files"] if p.exists()]
-        if not valid_files:
-            state["pending_files"] = []
-            return
-
-        concatenate_video_files(valid_files, video_path)
-
-        for p in valid_files:
-            if p != video_path:
-                try:
-                    p.unlink()
-                except OSError:
-                    pass
-
-        state["pending_files"] = []
-
-    def flush(self):
-        for video_key in self.video_chunk_state:
-            self._flush_chunk(video_key)
-
-    def _save_episode_video(self, video_key: str, episode_index: int) -> dict:
-        self._init_video_state(video_key, episode_index)
-        state = self.video_chunk_state[video_key]
-
-        temp_dir = self.root / "videos" / video_key / "temp"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        temp_video_path = temp_dir / f"ep_{episode_index}.mp4"
-
-        if video_key not in self.current_image_buffers:
-            raise ValueError(f"No image buffers registered for {video_key}")
-        frame_entries = self.current_image_buffers[video_key]
-
-        encode_video_from_entries(
-            frame_entries,
-            temp_video_path,
-            self.fps,
-            self.vcodec,
-            self.pix_fmt,
-            self.gop,
-            self.crf,
-            fast_decode=self.fast_decode,
-        )
-
-        ep_duration = get_video_duration_in_s(temp_video_path)
-        ep_size = get_file_size_in_mb(temp_video_path)
-
-        if state["current_chunk_size"] + ep_size >= self.meta.video_files_size_in_mb:
-            self._flush_chunk(video_key)
-            state["chunk_idx"], state["file_idx"] = update_chunk_file_indices(
-                state["chunk_idx"], state["file_idx"], self.meta.chunks_size
-            )
-            state["current_chunk_size"] = 0.0
-            state["current_chunk_duration"] = 0.0
-
-        state["pending_files"].append(temp_video_path)
-        state["current_chunk_size"] += ep_size
-
-        from_timestamp = state["current_chunk_duration"]
-        state["current_chunk_duration"] += ep_duration
-
-        metadata = {
-            "episode_index": episode_index,
-            f"videos/{video_key}/chunk_index": state["chunk_idx"],
-            f"videos/{video_key}/file_index": state["file_idx"],
-            f"videos/{video_key}/from_timestamp": from_timestamp,
-            f"videos/{video_key}/to_timestamp": state["current_chunk_duration"],
-        }
-
-        if episode_index == 0:
-            self.meta.info["features"][video_key]["info"] = get_video_info(temp_video_path)
-            write_info(self.meta.info, self.meta.root)
-
-        return metadata
-def load_module_from_path(name, path):
+def load_module_from_path(name: str, path: str):
+    """Dynamically load a Python module from file path."""
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
-def convert_bag_worker(args):
+
+# =============================================================================
+# Core Conversion Logic - SINGLE PASS
+# =============================================================================
+
+def convert_bag_single_pass(
+    bag_path: Path,
+    output_dir: Path,
+    dataset_name: str,
+    processor_path: str,
+    mapping_path: str,
+    repo_id: str,
+    robot_type: str,
+    task_desc: str,
+    fps: int,
+    vcodec: str,
+    crf: int,
+) -> dict:
     """
-    Worker function to process a SINGLE bag into a SINGLE episode dataset.
-    Strictly follows LeRobot standards using add_frame.
-    """
-    (bag_path, output_dir, dataset_name, processor_path, mapping_path, 
-     repo_id, robot_type, task_desc, fps, vcodec, crf) = args
+    Convert a SINGLE bag into a SINGLE episode dataset using SINGLE-PASS reading.
     
+    Key optimization: Read bag only once, collect timestamps AND data simultaneously.
+    """
     result = {
         'bag': str(bag_path),
         'success': False,
@@ -536,7 +339,7 @@ def convert_bag_worker(args):
     }
     
     try:
-        # 1. Setup Environment
+        # 1. Load configuration
         typestore = get_typestore(Stores.ROS2_HUMBLE)
         proc_mod = load_module_from_path("custom_processor", processor_path)
         message_processors = proc_mod.get_message_processors()
@@ -544,290 +347,447 @@ def convert_bag_worker(args):
         map_mod = load_module_from_path("custom_mapping", mapping_path)
         mapping = map_mod.get_state_action_mapping()
         
-        # 2. Pass 1: Scan Timestamps
-        topic_timestamps = {}
-        target_topics = [t.name for t in config.robot_state.topics]
-        for cam in config.cameras:
-            target_topics.extend([t.name for t in cam.topics])
-        for t in target_topics: topic_timestamps[t] = []
-        
+        # 2. Build topic configuration
+        target_topics = set()
         topic_to_config = {}
-        for t in config.robot_state.topics: topic_to_config[t.name] = t
-        for c in config.cameras:
-           for t in c.topics: topic_to_config[t.name] = t
-           
+        camera_topics = {}  # topic -> camera_id
+        
+        for t in config.robot_state.topics:
+            target_topics.add(t.name)
+            topic_to_config[t.name] = t
+            
+        for cam in config.cameras:
+            for t in cam.topics:
+                target_topics.add(t.name)
+                topic_to_config[t.name] = t
+                camera_topics[t.name] = cam.camera_id
+        
+        # =====================================================================
+        # SINGLE PASS: Collect timestamps AND raw data simultaneously
+        # =====================================================================
+        topic_data = {t: [] for t in target_topics}  # (timestamp, data_dict)
+        image_shape_cache = {}
+        
         with RosbagReader(bag_path) as reader:
+            # Register custom types
             for processor in message_processors.values():
-                processor.register_custom_types(reader, typestore)
-            connections = [x for x in reader.connections if x.topic in topic_timestamps]
+                if hasattr(processor, 'register_custom_types'):
+                    processor.register_custom_types(reader, typestore)
+            
+            connections = [c for c in reader.connections if c.topic in target_topics]
+            
             for conn, ts, rawdata in reader.messages(connections=connections):
                 msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
                 real_ts = get_message_timestamp(msg, ts)
-                topic_timestamps[conn.topic].append(real_ts)
                 
-        for t in topic_timestamps:
-            topic_timestamps[t] = np.array(sorted(topic_timestamps[t]))
-            
-        # 3. Synchronize
-        synchronizer = TimestampSynchronizer(None) # Use Nearest Neighbor strict
+                # Process message based on type
+                if conn.topic in camera_topics:
+                    cam_id = camera_topics[conn.topic]
+                    t_cfg = topic_to_config[conn.topic]
+                    
+                    if "CompressedImage" in t_cfg.type:
+                        # Store compressed bytes (decode later during video encoding)
+                        img_bytes = bytes(msg.data)
+                        if cam_id not in image_shape_cache:
+                            sample = decode_compressed_rgb(img_bytes)
+                            image_shape_cache[cam_id] = sample.shape
+                        topic_data[conn.topic].append((real_ts, {
+                            'type': 'image',
+                            'camera_id': cam_id,
+                            'storage': 'compressed',
+                            'data': img_bytes
+                        }))
+                    elif hasattr(msg, 'encoding'):
+                        # Raw image - MUST COPY to avoid memory overwrite
+                        if msg.encoding in ('rgb8', 'bgr8'):
+                            img = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+                                msg.height, msg.width, 3
+                            ).copy()  # CRITICAL: .copy() to avoid reference issues
+                            if msg.encoding == 'bgr8':
+                                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                            image_shape_cache.setdefault(cam_id, img.shape)
+                            topic_data[conn.topic].append((real_ts, {
+                                'type': 'image',
+                                'camera_id': cam_id,
+                                'storage': 'array',
+                                'data': img
+                            }))
+                else:
+                    # Robot state/action data
+                    proc = (message_processors.get(conn.msgtype.split('/')[-1]) or 
+                            message_processors.get(conn.msgtype))
+                    if proc:
+                        payload = proc.process(msg, ts)
+                        topic_data[conn.topic].append((real_ts, {
+                            'type': 'state_action',
+                            'payload': payload
+                        }))
         
-        # Select reference topic (min frames)
-        if config.sync_reference:
-             ref_topic = config.sync_reference
+        # 3. Sort by timestamp and extract timestamps array
+        topic_timestamps = {}
+        topic_sorted_data = {}
+        for topic, data_list in topic_data.items():
+            if data_list:
+                data_list.sort(key=lambda x: x[0])
+                topic_timestamps[topic] = np.array([d[0] for d in data_list])
+                topic_sorted_data[topic] = [d[1] for d in data_list]
+            else:
+                topic_timestamps[topic] = np.array([])
+                topic_sorted_data[topic] = []
+        
+        # Clear original data to free memory
+        del topic_data
+        
+        # 4. Synchronize streams
+        if hasattr(config, 'sync_reference') and config.sync_reference:
+            ref_topic = config.sync_reference
         else:
-             candidate_topics = {t: len(ts) for t, ts in topic_timestamps.items() if len(ts) > 0}
-             if not candidate_topics:
-                 result['error'] = "No data found in any monitored topics"
-                 return result
-             ref_topic = min(candidate_topics, key=candidate_topics.get)
-
+            candidate = {t: len(ts) for t, ts in topic_timestamps.items() if len(ts) > 0}
+            if not candidate:
+                result['error'] = "No data found in any monitored topics"
+                return result
+            ref_topic = min(candidate, key=candidate.get)
+        
         ref_ts = topic_timestamps[ref_topic]
         other_streams = {k: v for k, v in topic_timestamps.items() if k != ref_topic}
+        
+        synchronizer = TimestampSynchronizer()
         sync_indices = synchronizer.synchronize_streams(ref_ts, other_streams)
         sync_indices[ref_topic] = list(range(len(ref_ts)))
         
         num_frames = len(ref_ts)
         if num_frames == 0:
-            raise ValueError("No frames found after synchronization")
-
-        # Build timestamp -> [frame_indices] lookup (One-to-Many due to NN)
-        timestamp_to_frames = {}
-        for topic, indices in sync_indices.items():
-            ts_arr = topic_timestamps[topic]
-            for frame_idx, time_idx in enumerate(indices):
-                if time_idx is not None:
-                    t_val = ts_arr[time_idx]
-                    key = (topic, t_val)
-                    if key not in timestamp_to_frames:
-                        timestamp_to_frames[key] = []
-                    timestamp_to_frames[key].append(frame_idx)
-
-        # 4. Collect Data into RAM
+            result['error'] = "No frames found after synchronization"
+            return result
+        
+        # 5. Assemble synchronized frames
         frame_buffer = [{'state': {}, 'action': {}, 'images': {}} for _ in range(num_frames)]
-        image_shape_cache: Dict[str, Tuple[int, int, int]] = {}
         
-        with RosbagReader(bag_path) as reader:
-            connections = [x for x in reader.connections if x.topic in topic_timestamps]
-            for conn, ts, rawdata in reader.messages(connections=connections):
-                msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
-                real_ts = get_message_timestamp(msg, ts)
+        for topic, indices in sync_indices.items():
+            sorted_data = topic_sorted_data[topic]
+            for frame_idx, data_idx in enumerate(indices):
+                if data_idx is None or data_idx >= len(sorted_data):
+                    continue
                 
-                key = (conn.topic, real_ts)
-                target_frames = timestamp_to_frames.get(key, [])
-                if not target_frames: continue
-                    
-                image_entry = None
-                payload_proc = None
-                
-                cam_id = next((c.camera_id for c in config.cameras for t in c.topics if t.name == conn.topic), None)
-                
-                if cam_id:
-                    t_cfg = topic_to_config[conn.topic]
-                    if "CompressedImage" in t_cfg.type:
-                        img_bytes = bytes(msg.data)
-                        if cam_id not in image_shape_cache:
-                            sample_rgb = decode_compressed_rgb(img_bytes)
-                            image_shape_cache[cam_id] = sample_rgb.shape
-                        image_entry = {"storage": "compressed", "data": img_bytes}
-
-                    elif hasattr(msg, 'encoding'):
-                        if msg.encoding == 'rgb8':
-                            img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
-                            image_shape_cache.setdefault(cam_id, img.shape)
-                            image_entry = {"storage": "array", "data": img}
-                        elif msg.encoding == 'bgr8':
-                            img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
-                            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                            image_shape_cache.setdefault(cam_id, img.shape)
-                            image_entry = {"storage": "array", "data": img}
-
-                else:
-                    proc = message_processors.get(conn.msgtype.split('/')[-1]) or message_processors.get(conn.msgtype)
-                    if proc:
-                        payload_proc = proc.process(msg, ts)
-
-                for f_idx in target_frames:
-                    if cam_id and image_entry is not None:
-                        frame_buffer[f_idx]['images'][cam_id] = image_entry
-                    elif payload_proc:
-                        if 'state' in payload_proc:
-                            frame_buffer[f_idx]['state'].update(payload_proc['state'])
-                        if 'action' in payload_proc:
-                            frame_buffer[f_idx]['action'].update(payload_proc['action'])
-
-        # 5. Define Features 
-        valid_idx = 0
-        s0_dict = frame_buffer[valid_idx]['state']
-        a0_dict = frame_buffer[valid_idx]['action']
+                data = sorted_data[data_idx]
+                if data['type'] == 'image':
+                    frame_buffer[frame_idx]['images'][data['camera_id']] = {
+                        'storage': data['storage'],
+                        'data': data['data']
+                    }
+                elif data['type'] == 'state_action':
+                    payload = data['payload']
+                    if 'state' in payload:
+                        frame_buffer[frame_idx]['state'].update(payload['state'])
+                    if 'action' in payload:
+                        frame_buffer[frame_idx]['action'].update(payload['action'])
         
-        # Aliasing
-        if 'q_pos' in s0_dict: s0_dict['driver/q_pos'] = s0_dict['q_pos']
-        if 'eef' in s0_dict: s0_dict['end/eef'] = s0_dict['eef']
-        if 'q_pos' in a0_dict: a0_dict['driver/q_pos'] = a0_dict['q_pos']
-        if 'eef' in a0_dict: a0_dict['end/eef'] = a0_dict['eef']
-
-        try:
-            s0 = mapping.state_combine_fn(s0_dict)
-            a0 = mapping.action_combine_fn(a0_dict)
-        except Exception as e:
-            raise ValueError(f"Mapping failed on reference frame {valid_idx}: {e}")
-            
-        s0 = np.asarray(s0, dtype=np.float32)
-        a0 = np.asarray(a0, dtype=np.float32)
+        # Clear intermediate data
+        del topic_sorted_data, topic_timestamps
+        
+        # 6. Extract images for video encoding ONLY (not for add_frame)
+        camera_images = {cam.camera_id: [] for cam in config.cameras}
+        
+        for frame in frame_buffer:
+            for cam in config.cameras:
+                cid = cam.camera_id
+                if cid in frame['images']:
+                    entry = frame['images'][cid]
+                    if entry['storage'] == 'compressed':
+                        img = decode_compressed_rgb(entry['data'])
+                    else:
+                        img = entry['data']
+                    camera_images[cid].append(img)
+            # Clear image data from frame to save memory (we don't need it for add_frame anymore)
+            frame['images'] = {}
+        
+        # Encode videos to temp files - EACH VIDEO IN SEPARATE DIRECTORY
+        # This is critical because _save_episode_video may delete the temp directory
+        temp_base_dir = Path(tempfile.mkdtemp())
+        video_paths = {}
+        
+        for cid, images in camera_images.items():
+            if images:
+                # Create separate temp directory for each video (same as reference code)
+                temp_video_dir = Path(tempfile.mkdtemp(dir=temp_base_dir))
+                video_path = temp_video_dir / f"{cid}.mp4"
+                encode_video(images, video_path, fps, vcodec=vcodec, crf=crf)
+                video_paths[cid] = video_path
+                logger.debug(f"Encoded {len(images)} frames for camera {cid} -> {video_path}")
+        
+        # Release image memory IMMEDIATELY after encoding
+        del camera_images
+        
+        # 7. Define features from first valid frame
+        s0_dict = frame_buffer[0]['state']
+        a0_dict = frame_buffer[0]['action']
+        
+        # Apply aliasing if needed
+        for alias_from, alias_to in [('q_pos', 'driver/q_pos'), ('eef', 'end/eef')]:
+            if alias_from in s0_dict:
+                s0_dict[alias_to] = s0_dict[alias_from]
+            if alias_from in a0_dict:
+                a0_dict[alias_to] = a0_dict[alias_from]
+        
+        s0 = np.asarray(mapping.state_combine_fn(s0_dict), dtype=np.float32)
+        a0 = np.asarray(mapping.action_combine_fn(a0_dict), dtype=np.float32)
         
         features = {
             "observation.state": {"dtype": "float32", "shape": s0.shape, "names": None},
             "action": {"dtype": "float32", "shape": a0.shape, "names": None},
         }
-        # Note: task is NOT a feature - it's handled as metadata via save_episode
-        # This avoids schema conflicts in multiprocessing context (following Astribot pattern)
-            
-        for cid in config.cameras:
-            c_name = cid.camera_id
-            if c_name in image_shape_cache:
-                h, w, c = image_shape_cache[c_name]
-                features[f"observation.images.{c_name}"] = {
+        
+        for cam in config.cameras:
+            cid = cam.camera_id
+            if cid in image_shape_cache:
+                h, w, c = image_shape_cache[cid]
+                features[f"observation.images.{cid}"] = {
                     "dtype": "video",
                     "shape": (h, w, c),
                     "names": ["height", "width", "channels"]
                 }
-
-        # Create Episode Dataset
-        episode_dir = output_dir / dataset_name
-        if episode_dir.exists(): shutil.rmtree(episode_dir)
         
-        dataset = OptimizedLeRobotDataset.create(
+        # 8. Create dataset
+        # IMPORTANT: Set image_writer_threads=0 to SKIP writing temporary images
+        # This saves huge I/O overhead since we already have pre-encoded videos
+        episode_dir = output_dir / dataset_name
+        if episode_dir.exists():
+            shutil.rmtree(episode_dir)
+        
+        dataset = LeRobotDataset.create(
             repo_id=repo_id,
             root=episode_dir,
             robot_type=robot_type,
             fps=fps,
             features=features,
             use_videos=True,
-            image_writer_threads=0
+            image_writer_threads=0,  # CRITICAL: Skip temporary image writing!
         )
-        dataset.vcodec = vcodec
-        dataset.crf = crf
-        dataset.fast_decode = True
-        dataset.pix_fmt = "yuv420p"
-        dataset.gop = 2
-        dataset.encoding_threads = max(1, len(config.cameras))
-
-        # 6. Add Frames Strict
+        
+        # 9. Add frames with PLACEHOLDER images (real data already in pre-encoded videos)
+        # This is much faster since no disk I/O for images
+        logger.info(f"Adding {len(frame_buffer)} frames (using placeholder images)...")
         for i, frame_data in enumerate(frame_buffer):
-            # State
             s_dict = frame_data['state']
-            if 'q_pos' in s_dict: s_dict['driver/q_pos'] = s_dict['q_pos']
-            if 'eef' in s_dict: s_dict['end/eef'] = s_dict['eef']
-            s = np.asarray(mapping.state_combine_fn(s_dict), dtype=np.float32)
-            
-            # Action
             a_dict = frame_data['action']
-            if 'q_pos' in a_dict: a_dict['driver/q_pos'] = a_dict['q_pos']
-            if 'eef' in a_dict: a_dict['end/eef'] = a_dict['eef']
+            
+            # Apply aliasing
+            for alias_from, alias_to in [('q_pos', 'driver/q_pos'), ('eef', 'end/eef')]:
+                if alias_from in s_dict:
+                    s_dict[alias_to] = s_dict[alias_from]
+                if alias_from in a_dict:
+                    a_dict[alias_to] = a_dict[alias_from]
+            
+            s = np.asarray(mapping.state_combine_fn(s_dict), dtype=np.float32)
             a = np.asarray(mapping.action_combine_fn(a_dict), dtype=np.float32)
             
+            # Create frame dict with PLACEHOLDER images (to pass validation)
             frame_dict = {
                 "observation.state": s,
                 "action": a,
-                "task": task_desc if task_desc else "Manipulation Task",  # Task as metadata, not schema feature
+                "task": task_desc or "Manipulation Task",
             }
-            image_store = frame_data.get('images', {})
-
-            for cid in config.cameras:
-                c_id = cid.camera_id
-                feature_key = f"observation.images.{c_id}"
-                if feature_key not in features:
-                    continue
-                if c_id in image_store:
-                    img_entry = image_store[c_id]
-                    frame_dict[feature_key] = img_entry
-                else:
-                    raise ValueError(f"Frame {i}: Missing image for {c_id}")
-
+            
+            # Add placeholder images - just for schema validation, not written to disk
+            for cam in config.cameras:
+                cid = cam.camera_id
+                feature_key = f"observation.images.{cid}"
+                if feature_key in features:
+                    h, w, c = features[feature_key]["shape"]
+                    frame_dict[feature_key] = np.zeros((h, w, c), dtype=np.uint8)
+            
             dataset.add_frame(frame_dict)
-            frame_buffer[i] = None  # Release memory as we go
-
-        # 7. Save Episode
-        dataset.save_episode()
-        dataset.flush()
+            
+            # Release memory
+            frame_buffer[i] = None
+        
+        logger.info(f"Frames added successfully")
+        
+        # 10. Save episode with pre-encoded videos
+        dataset._wait_image_writer()
+        
+        episode_buffer = dataset.episode_buffer
+        episode_length = episode_buffer.pop("size")
+        tasks_list = episode_buffer.pop("task")
+        episode_tasks = list(set(tasks_list))
+        episode_index = 0
+        
+        episode_buffer["index"] = np.arange(0, episode_length)
+        episode_buffer["episode_index"] = np.zeros((episode_length,), dtype=np.int32)
+        
+        dataset.meta.save_episode_tasks(episode_tasks)
+        episode_buffer["task_index"] = np.array([
+            dataset.meta.get_task_index(t) for t in tasks_list
+        ])
+        
+        # Stack non-video features for saving
+        for key, ft in dataset.features.items():
+            if key in ["index", "episode_index", "task_index"]:
+                continue
+            if ft["dtype"] in ["image", "video"]:
+                continue
+            if key in episode_buffer:
+                episode_buffer[key] = np.stack(episode_buffer[key])
+        
+        # Compute stats - only for non-video features (same as reference code)
+        logger.info(f"Computing episode stats...")
+        non_video_features = {
+            k: v for k, v in dataset.features.items() 
+            if v["dtype"] not in ["image", "video"]
+        }
+        non_video_buffer = {
+            k: v for k, v in episode_buffer.items()
+            if k not in dataset.meta.video_keys
+        }
+        ep_stats = compute_episode_stats(non_video_buffer, non_video_features)
+        logger.info(f"Episode stats computed successfully")
+        
+        # No need to delete temporary images - we didn't write any (image_writer_threads=0)
+        
+        # Save pre-encoded videos using _save_episode_video (same as reference code)
+        logger.info(f"Saving {len(video_paths)} pre-encoded videos...")
+        episode_metadata = {}
+        
+        for cid, temp_video_path in video_paths.items():
+            video_key = f"observation.images.{cid}"
+            logger.info(f"  Saving video: {video_key}")
+            
+            if not temp_video_path.exists():
+                raise FileNotFoundError(f"Source video not found: {temp_video_path}")
+            
+            # Use _save_episode_video with temp_path parameter (same as reference code)
+            video_metadata = dataset._save_episode_video(
+                video_key=video_key,
+                episode_index=episode_index,
+                temp_path=temp_video_path,
+            )
+            episode_metadata.update(video_metadata)
+        logger.info(f"Videos saved successfully")
+        
+        # Remove video features from episode_buffer before saving data
+        for video_key in list(episode_buffer.keys()):
+            if video_key in dataset.meta.video_keys:
+                del episode_buffer[video_key]
+        
+        # Save episode data to parquet files
+        logger.info(f"Saving episode data...")
+        ep_data_metadata = dataset._save_episode_data(episode_buffer)
+        episode_metadata.update(ep_data_metadata)
+        logger.info(f"Episode data saved")
+        
+        # Save episode metadata
+        logger.info(f"Saving episode metadata...")
+        dataset.meta.save_episode(
+            episode_index, episode_length, episode_tasks, ep_stats, episode_metadata
+        )
+        logger.info(f"Episode metadata saved")
+        
+        # Update video info
+        logger.info(f"Updating video info...")
+        for video_key in dataset.meta.video_keys:
+            dataset.meta.update_video_info(video_key)
+        logger.info(f"Video info updated")
+        
+        logger.info(f"Clearing episode buffer and finalizing...")
+        dataset.clear_episode_buffer(delete_images=False)
         dataset.finalize()
+        logger.info(f"Finalized successfully")
+        
+        # Cleanup temp base directory
+        shutil.rmtree(temp_base_dir, ignore_errors=True)
         
         result['success'] = True
         result['frames'] = num_frames
         result['dataset_path'] = str(episode_dir)
         
     except Exception as e:
-        result['error'] = str(e)
-        # Immediate logging for visibility
-        sys.stderr.write(f"\n[ERROR] Processing {bag_path.name} failed: {e}\n")
-        sys.stderr.flush()
-        
+        result['error'] = f"{e}\n{traceback.format_exc()}"
+        logger.error(f"Failed processing {bag_path}: {e}")
+    
     return result
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Direct ROS2 to LeRobot Converter (Standard Mode)")
+
+def convert_bag_worker(args: tuple) -> dict:
+    """Wrapper for ProcessPoolExecutor."""
+    return convert_bag_single_pass(*args)
+
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Optimized ROS2 to LeRobot Converter (Single-Pass)"
+    )
     
     # Input/Output
-    parser.add_argument("--bags-dir", help="Directory containing .mcap files")
-    parser.add_argument("--bag", help="Single .mcap file")
-    parser.add_argument("--output-dir", required=True, help="Root output directory for merged dataset")
+    parser.add_argument("--bags-dir", type=Path, help="Directory containing ROS bags")
+    parser.add_argument("--bag", type=Path, help="Single bag file/directory")
+    parser.add_argument("--output-dir", type=Path, required=True, help="Output directory")
     
-    # Configs
-    parser.add_argument("--custom-processor", required=True, help="Path to python file defining MessageProcessors and Config")
-    parser.add_argument("--mapping-file", required=True, help="Path to custom_state_action_mapping.py")
+    # Config files
+    parser.add_argument("--custom-processor", required=True, help="Processor module path")
+    parser.add_argument("--mapping-file", required=True, help="Mapping module path")
     
-    # Dataset Meta
-    parser.add_argument("--repo-id", required=True, help="HuggingFace Repo ID")
+    # Dataset metadata
+    parser.add_argument("--repo-id", required=True, help="HuggingFace repo ID")
     parser.add_argument("--robot-type", required=True, help="Robot type name")
-    parser.add_argument("--task-description", help="Task description")
-    parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--workers", type=int, default=4, help="Number of parallel processes")
+    parser.add_argument("--task-description", default="Manipulation Task", help="Task description")
+    parser.add_argument("--fps", type=int, default=30, help="Dataset FPS")
+    parser.add_argument("--workers", type=int, default=4, help="Parallel workers")
     
-    # Video Encoding
-    parser.add_argument("--vcodec", default="libsvtav1", help="Video codec (default: libsvtav1 for CPU)")
-    parser.add_argument("--crf", type=int, default=30)
+    # Video encoding
+    parser.add_argument("--vcodec", default="libsvtav1", help="Video codec")
+    parser.add_argument("--crf", type=int, default=30, help="Video quality (CRF)")
     
     args = parser.parse_args()
     
-    # 1. Collect Bags
+    # Collect bags
     bags = []
     if args.bag:
         bags.append(Path(args.bag))
     elif args.bags_dir:
         bd = Path(args.bags_dir)
-        metas = sorted(list(bd.rglob("metadata.yaml")))
+        metas = sorted(bd.rglob("metadata.yaml"))
         if metas:
             bags = [p.parent for p in metas]
         else:
-            bags = sorted(list(bd.rglob("*.mcap"))) + sorted(list(bd.rglob("*.db3")))
-            
+            bags = sorted(bd.rglob("*.mcap")) + sorted(bd.rglob("*.db3"))
+    
     if not bags:
         print("No bags found!")
         sys.exit(1)
-        
-    print(f"Found {len(bags)} bags. Using {args.workers} workers.")
     
-    # 2. Parallel Processing (Separate Mode)
+    print(f"Found {len(bags)} bags. Using {args.workers} workers.")
+    print(f"PyAV available: {USE_PYAV}")
+    
+    # Setup directories
     output_root = Path(args.output_dir)
-    separate_dir = output_root / "_separate_episodes"
+    # Keep temp episodes outside final output dir to avoid pre-creating it
+    separate_dir = output_root.parent / f"{output_root.name}_separate_episodes"
     separate_dir.mkdir(parents=True, exist_ok=True)
-
+    
+    # Build tasks
     tasks = []
     for i, bag in enumerate(bags):
-        ep_name = f"episode_{i}_{bag.stem}"
+        ep_name = f"episode_{i:04d}_{bag.stem}"
         tasks.append((
-            bag, separate_dir, ep_name, 
+            bag, separate_dir, ep_name,
             args.custom_processor, args.mapping_file,
-            f"{args.repo_id}/{ep_name}", 
+            f"{args.repo_id}/{ep_name}",
             args.robot_type, args.task_description,
             args.fps, args.vcodec, args.crf
         ))
-        
+    
+    # Parallel processing
     success_datasets = []
-    failed_episodes = [] 
+    failed_episodes = []
+    
+    start_time = time.time()
     
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(convert_bag_worker, task): task for task in tasks}
+        futures = {executor.submit(convert_bag_worker, t): t for t in tasks}
         
         with tqdm(total=len(bags), desc="Converting Episodes") as pbar:
             for future in as_completed(futures):
@@ -835,77 +795,57 @@ if __name__ == "__main__":
                 if res['success']:
                     success_datasets.append(Path(res['dataset_path']))
                 else:
-                    err_msg = f"{res['bag']} (Error: {res['error']})"
-                    failed_episodes.append(err_msg)
-                    tqdm.write(f"FAILED: {err_msg}")
+                    failed_episodes.append(f"{res['bag']}: {res['error']}")
+                    tqdm.write(f"FAILED: {res['bag']}")
                 pbar.update(1)
-                
-    # 3. Summary & Merge
-    print(f"\nConversion Finished.")
-    print(f"Success: {len(success_datasets)}")
+    
+    elapsed = time.time() - start_time
+    
+    # Summary
+    print(f"\n{'='*70}")
+    print(f"Conversion completed in {elapsed:.1f}s")
+    print(f"Success: {len(success_datasets)} / {len(bags)}")
     print(f"Failed: {len(failed_episodes)}")
+    print(f"{'='*70}")
     
     if failed_episodes:
-        print("\n=== Failed Episodes ===")
-        for fail_msg in failed_episodes:
-            print(f"- {fail_msg}")
-        print("=======================\n")
+        print("\nFailed episodes:")
+        for f in failed_episodes[:10]:
+            print(f"  - {f[:200]}...")
     
     if not success_datasets:
-        print("No valid datasets generated. Exiting.")
+        print("No valid datasets. Exiting.")
         sys.exit(1)
-        
-    print("Merging into final dataset...")
+    
+    # Merge datasets
+    if output_root.exists():
+        shutil.rmtree(output_root)
+    print("\nMerging into final dataset...")
     datasets_to_merge = []
-    for dpath in success_datasets:
+    for dpath in sorted(success_datasets):
         try:
             ds = LeRobotDataset(root=dpath, repo_id=dpath.name)
             datasets_to_merge.append(ds)
         except Exception as e:
-            print(f"Failed to load {dpath} for merging: {e}")
-
+            print(f"Failed to load {dpath}: {e}")
+    
     if datasets_to_merge:
-        merge_target = output_root / "_merged_tmp"
-        if merge_target.exists():
-            shutil.rmtree(merge_target)
-
         merged = merge_datasets(
             datasets=datasets_to_merge,
-            output_dir=merge_target,
-            output_repo_id=args.repo_id
+            output_dir=output_root,
+            output_repo_id=args.repo_id,
         )
-        # Clean previous merged outputs except separate episodes
-        for existing in list(output_root.iterdir()):
-            if existing.name == "_separate_episodes":
-                continue
-            if existing == merge_target:
-                continue
-            if existing.is_dir():
-                shutil.rmtree(existing)
-            else:
-                existing.unlink()
-
-        # Move merged dataset into final location
-        for item in merge_target.iterdir():
-            destination = output_root / item.name
-            if destination.exists():
-                if destination.is_dir():
-                    shutil.rmtree(destination)
-                else:
-                    destination.unlink()
-            shutil.move(str(item), destination)
-
-        if merge_target.exists():
-            shutil.rmtree(merge_target)
-
-        print(f"Merge Complete! Final dataset at: {output_root}")
+        
+        print(f"\nMerge Complete!")
+        print(f"Output: {output_root}")
+        print(f"Total Episodes: {merged.meta.total_episodes}")
         print(f"Total Frames: {merged.meta.total_frames}")
-
-        # Cleanup temporary episodes once final dataset is ready
+        
+        # Cleanup temporary separate datasets
         if separate_dir.exists():
             shutil.rmtree(separate_dir)
-            print("Removed temporary _separate_episodes directory.")
+            print("Cleaned up temporary episode datasets.")
 
-    # Cleanup separate (Optional: ask user)
-    # shutil.rmtree(separate_dir)
 
+if __name__ == "__main__":
+    main()

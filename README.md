@@ -4,30 +4,56 @@
 
 ## 主要特性
 
-### 1. 优化同步代码
-解决了数据同步过程中的性能瓶颈。
-- **性能表现**: 76个数据集仅需 **13分钟** 即可完成同步。
+### 1. 单步直出 LeRobot 数据集（`ros2_to_lerobot_direct.py`）
+- 单遍读取 ROS2 bag，同步 + 编码 + 写数据一次完成。
+- 即时视频编码（PyAV 优先，缺失时回落 FFmpeg），释放内存更快。
+- 预编码视频直接落盘，跳过中间图片写入，I/O 最小化。
+- 临时 episode 放在独立目录，最终合并时不会因目标目录已存在而报错。
 
-### 2. 优化转换代码
-针对视频编码和数据处理流程进行了深度优化。
-- **性能表现**: 76个数据集仅需 **11分钟** 即可完成转换（使用 GPU 资源）。
-- **对比**: 相比之前的硬件编码方案（60条数据需2小时），效率大幅提升。
-- **技术改进**:
-    1.  **并行化运行**: 开启多线程并行编译，充分利用计算资源。
-    2.  **减少 I/O**: 优化了数据流，直接基于源图像目录进行视频编码，避免了将图像复制到数据集目录的冗余 I/O 操作。
+### 2. 传统双步流程（保留）
+- **同步阶段**: `ros2_to_lerobot_converter.py`，76 个数据集约 **13 分钟**。
+- **转换阶段**: `synced_to_lerobot_converter.py`，76 个数据集约 **11 分钟**（GPU）。
+- 核心优化：并行、最小化 I/O、硬件/软件编码任选。
 
 ## 安装
 
-需要安装特定版本的 `rosbags` 库：
+需要安装的关键依赖：
 
 ```bash
-# 特定版本 rosbag 包
+# rosbag 读取
 pip install rosbags==0.10.4 --index-url https://pypi.org/simple
+
+# 建议安装 PyAV（可选，缺失则自动用 FFmpeg 子进程）
+pip install av
 ```
+
+确保系统已装 FFmpeg（用于回退编码和探测）。
 
 ## 使用指南
 
-### 第一步：ROS2 Bag 同步 (ROS2 to Synced Format)
+### 方案 A：单步从 ROS2 Bag 直接生成 LeRobot 数据集（推荐）
+
+```bash
+python ros2_to_lerobot_direct.py \
+    --bags-dir /path/to/bags \
+    --output-dir /path/to/output_dataset \
+    --repo-id your_repo_id \
+    --robot-type your_robot \
+    --task-description "Task description" \
+    --custom-processor /workspace/openloong2lerobot/processors_qingloongROS2.py \
+    --mapping-file /workspace/openloong2lerobot/custom_state_action_mapping_qingloongROS2.py \
+    --fps 30 \
+    --workers 4 \
+    --vcodec libsvtav1 \
+    --crf 30
+```
+
+说明：
+- 输出目录若已存在会被清理，请提前备份。
+- 预编码视频放在临时目录，合并完成后自动清理。
+- `--workers` 控制并行处理 bag 数量，依机器 I/O 适当调节。
+
+### 方案 B：ROS2 Bag 同步 (ROS2 to Synced Format)
 
 使用 `ros2_to_lerobot_converter.py` 将 ROS2 bag 数据提取并同步。
 
