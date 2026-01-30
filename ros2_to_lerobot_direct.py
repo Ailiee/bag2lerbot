@@ -484,6 +484,31 @@ def convert_bag_single_pass(
         
         # Clear intermediate data
         del topic_sorted_data, topic_timestamps
+
+        # 5.5 Backfill action with next-state when action key is missing
+        state_data = {}
+        action_data = {}
+        for frame in frame_buffer:
+            for key, value in frame['state'].items():
+                state_data.setdefault(key, []).append(value)
+            for key, value in frame['action'].items():
+                action_data.setdefault(key, []).append(value)
+
+        for key, state_values in state_data.items():
+            if key not in action_data and state_values:
+                action_values = list(state_values)
+                if len(action_values) > 1:
+                    action_values.pop(0)
+                    action_values.append(action_values[-1])
+                action_data[key] = action_values
+
+        if action_data:
+            for i, frame in enumerate(frame_buffer):
+                for key, values in action_data.items():
+                    if key in frame['action']:
+                        continue
+                    if i < len(values):
+                        frame['action'][key] = values[i]
         
         # 6. Extract images for video encoding ONLY (not for add_frame)
         camera_images = {cam.camera_id: [] for cam in config.cameras}

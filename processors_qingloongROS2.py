@@ -125,11 +125,12 @@ class ConfigProvider(MessageProcessor):
                 pass
 
         # Method 2: Load from .msg files (FALLBACK / SUPPLEMENT)
+        base_path = Path(__file__).parent / "qinglong_msg"
         msg_files = {
-            'driver_pvt/msg/Joint': '/workspace/openloong2lerobot/qinglong_msg/Joint.msg',
-            'driver_pvt/msg/Limb': '/workspace/openloong2lerobot/qinglong_msg/Limb.msg',
-            'driver_pvt/msg/DriverPVT': '/workspace/openloong2lerobot/qinglong_msg/DriverPVT.msg',
-            'end_pos/msg/EndPos': '/workspace/openloong2lerobot/qinglong_msg/EndPos.msg',
+            'driver_pvt/msg/Joint': str(base_path / 'Joint.msg'),
+            'driver_pvt/msg/Limb': str(base_path / 'Limb.msg'),
+            'driver_pvt/msg/DriverPVT': str(base_path / 'DriverPVT.msg'),
+            'end_pos/msg/EndPos': str(base_path / 'EndPos.msg'),
         }
         
         add_types = {}
