@@ -24,6 +24,11 @@ python /workspace/code/bag2lerbot/ros2_to_lerobot_direct.py \
     --vcodec libsvtav1 \
     --crf 30
 
+pip install "datasets<4.0.0"
+cd /workspace/code/bag2lerbot/utils/lerobot_dataset_converter/
+python convert_dataset_v30_to_v21.py \
+    --repo-id=your_id \
+    --root=your_local_dir
 
 # 3. 将 ROS2 bag 批量转换成 LeRobot 中间格式
 # python /workspace/code/bag2lerbot/ros2_to_lerobot_converter.py batch \
