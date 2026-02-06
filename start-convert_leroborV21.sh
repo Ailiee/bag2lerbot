@@ -13,7 +13,7 @@
 # 3. 将 ROS2 bag 直接转换 LeRobot 
 python /workspace/code/bag2lerbot/ros2_to_lerobot_direct.py \
     --bags-dir /qinglong_datasets/qinglong/raw/${task_id} \
-    --output-dir /qinglong_datasets/qinglong/lerobot/${task_id} \
+    --output-dir /qinglong_datasets/qinglong/lerobot_v30/${task_id} \
     --repo-id ${repo_id} \
     --robot-type qingloongROS2 \
     --task-description "${task_description}" \
@@ -23,32 +23,17 @@ python /workspace/code/bag2lerbot/ros2_to_lerobot_direct.py \
     --workers 8  \
     --vcodec libsvtav1 \
     --crf 30
-
+    
+# 4. 转化数据
 pip install "datasets<4.0.0"
-cd /workspace/code/bag2lerbot/utils/lerobot_dataset_converter/
+cd /workspace/code/any4lerobot/ds_version_convert/v30_to_v21/
 python convert_dataset_v30_to_v21.py \
-    --repo-id=your_id \
-    --root=your_local_dir
+    --repo-id=${repo_id} \
+    --root=/qinglong_datasets/qinglong/lerobot_v30/${task_id} \
+    --output-root=/qinglong_datasets/qinglong/pretrain_lerobot_v21/${task_id}
+    
+cp /workspace/code/bag2lerbot/qingloong_modality.json /qinglong_datasets/qinglong/pretrain_lerobot_v21/${task_id}/meta/modality.json
 
-# 3. 将 ROS2 bag 批量转换成 LeRobot 中间格式
-# python /workspace/code/bag2lerbot/ros2_to_lerobot_converter.py batch \
-#   --bags-dir=/qinglong_datasets/qinglong/raw/${task_id} \
-#   --output-dir=/qinglong_datasets/qinglong/convert/${task_id} \
-#   --custom-processor=/workspace/code/bag2lerbot/processors_qingloongROS2.py
-
-
-# 4. 将中间格式进一步转成 LeRobot 官方数据集，并上传
-# python /workspace/code/bag2lerbot/synced_to_lerobot_converter.py \
-#   --input-dir  /qinglong_datasets/qinglong/convert/${task_id} \
-#   --output-dir /qinglong_datasets/qinglong/lerobot/${task_id} \
-#   --repo-id    ${repo_id} \
-#   --fps        30 \
-#   --robot-type qingloongROS2 \
-#   --mapping-file /workspace/code/bag2lerbot/custom_state_action_mapping_qingloongROS2.py \
-#   --use-hardware-encoding \
-#   --vcodec av1_nvenc \
-#   --crf 25 \
-#   --batch-size 6
 if [ $? -eq 0 ]; then
     echo "===========转换完成=============="
 else

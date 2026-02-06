@@ -7,6 +7,8 @@ Configuration is now embedded in the processor file, eliminating the need for se
 
 from typing import Any, Dict, List, Tuple
 import numpy as np
+import logging
+from scipy.spatial.transform import Rotation as R
 
 import sys
 import os
@@ -40,8 +42,8 @@ class ConfigProvider(MessageProcessor):
                 topics=[
                     TopicConfig(
                         name="/head/color/image_raw/compressed",
-                        type="sensor_msgs/CompressedImage",
-                        frequency=60.0,
+                        type="sensor_msgs/msg/CompressedImage",
+                        frequency=30.0,
                         compressed=True,
                         modality="rgb"
                     )
@@ -52,8 +54,8 @@ class ConfigProvider(MessageProcessor):
                 topics=[
                     TopicConfig(
                         name="/left/color/image_raw/compressed",
-                        type="sensor_msgs/CompressedImage",
-                        frequency=60.0,
+                        type="sensor_msgs/msg/CompressedImage",
+                        frequency=30.0,
                         compressed=True,
                         modality="rgb"
                     )
@@ -64,8 +66,8 @@ class ConfigProvider(MessageProcessor):
                 topics=[
                     TopicConfig(
                         name="/right/color/image_raw/compressed",
-                        type="sensor_msgs/CompressedImage",
-                        frequency=60.0,
+                        type="sensor_msgs/msg/CompressedImage",
+                        frequency=30.0,
                         compressed=True,
                         modality="rgb"
                     )
@@ -74,33 +76,35 @@ class ConfigProvider(MessageProcessor):
         ]
         
         # Robot state configuration
+        # Note: actual_joints contains 7 values (6 joints + 1 gripper)
+        # actual_tcp_pose contains end-effector pose (6D: x, y, z, rx, ry, rz)
         config.robot_state = RobotStateConfig(
             topics=[
                 TopicConfig(
-                    name="/left/ur5e/states",
-                    type="device_interfaces/msg/UrStates",
-                    frequency=100.0
+                    name="/left/ur5e/actual_joints",
+                    type="sensor_msgs/msg/JointState",
+                    frequency=500.0
                 ),
                 TopicConfig(
-                    name="/right/ur5e/states",
-                    type="device_interfaces/msg/UrStates",
-                    frequency=100.0
+                    name="/right/ur5e/actual_joints",
+                    type="sensor_msgs/msg/JointState",
+                    frequency=500.0
                 ),
                 TopicConfig(
-                    name="/left/gripper/state",
-                    type="dh_gripper_driver/msg/GripperState",
-                    frequency=100.0
+                    name="/left/ur5e/actual_tcp_pose",
+                    type="geometry_msgs/msg/PoseStamped",
+                    frequency=500.0
                 ),
                 TopicConfig(
-                    name="/right/gripper/state",
-                    type="dh_gripper_driver/msg/GripperState",
-                    frequency=100.0
-                )
+                    name="/right/ur5e/actual_tcp_pose",
+                    type="geometry_msgs/msg/PoseStamped",
+                    frequency=500.0
+                ),
             ]
         )
         
         # Synchronization settings
-        config.sync_tolerance_ms = 50.0
+        config.sync_tolerance_ms = 5000.0
         config.sync_reference = None  # Auto-select
         
         # Output settings
@@ -118,21 +122,17 @@ class ConfigProvider(MessageProcessor):
         """
         Register custom ROS2 message types.
         
-        Method 1: Load from .msg files (if you have source)
-        Method 2: Load from bag (fallback)
+        For standard ROS2 messages (sensor_msgs/msg/JointState, geometry_msgs/msg/PoseStamped),
+        this is usually not needed as they are already registered in the typestore.
         """
+        # Standard ROS2 messages should already be registered
+        # If you have custom messages, register them here
         from pathlib import Path
         from rosbags.typesys import get_types_from_msg
         
-        # Method 1: Load from .msg files (优先)
+        # Only register custom message types if needed
         msg_files = {
-            'device_interfaces/msg/EEFPos': '/workspace/ur/ur_ws/src/device_interfaces/msg/EEFPos.msg',
-            'device_interfaces/msg/Joints': '/workspace/ur/ur_ws/src/device_interfaces/msg/Joints.msg',
-            'device_interfaces/msg/UrStates': '/workspace/ur/ur_ws/src/device_interfaces/msg/UrStates.msg',
-            'dh_gripper_driver/msg/GripperState': '/workspace/ur/ur_ws/src/dh_gripper_driver/msg/GripperState.msg',
-            # 添加你的其他消息文件
-            # 'driver_pvt/msg/Limb': 'src/driver_pvt/msg/Limb.msg',
-            # 'driver_pvt/msg/Joint': 'src/driver_pvt/msg/Joint.msg',
+            # Add custom message types here if you have them
         }
         
         add_types = {}
@@ -142,23 +142,15 @@ class ConfigProvider(MessageProcessor):
                 try:
                     msg_text = msg_file.read_text()
                     add_types.update(get_types_from_msg(msg_text, name=msg_name))
-                except Exception as e:
-                    pass  # 如果文件不存在，使用方法2
+                except Exception:
+                    pass
         
-        # 注册从文件加载的类型
+        # Register custom types if any
         if add_types:
-            typestore.register(add_types)
-            # print(f"✓ Registered: {list(add_types.keys())}")
-
-        # Method 2: Load from bag (fallback - 如果没有.msg文件)
-        connections = reader.connections
-        connections_list = connections.values() if isinstance(connections, dict) else connections
-        
-        for connection in connections_list:
             try:
-                typestore.register(connection.msgdef)
+                typestore.register(add_types)
             except Exception:
-                pass  # 已经注册过
+                pass
     
     def process(self, msg: Any, timestamp: int) -> Dict[str, Any]:
         """Not used - this is a config provider only."""
@@ -169,61 +161,212 @@ class ConfigProvider(MessageProcessor):
         return [], []
 
 
-class UrStatesProcessor(MessageProcessor):
-    """Processor for device_interfaces/msg/UrStates messages."""
+class URJointStateProcessor(MessageProcessor):
+    """Processor for sensor_msgs/msg/JointState messages from UR5e robot."""
     
-    def process(self, msg: Any, timestamp: int) -> Dict[str, Any]:
-        """Process a UrStates message."""
+    def __init__(self, arm_side: str = None):
+        """
+        Initialize processor for a specific arm side.
+        
+        Args:
+            arm_side: 'left' or 'right', or None for auto-detection
+        """
+        self.arm_side = arm_side
+    
+    def _detect_arm_side(self, msg: Any = None, topic: str = None) -> str:
+        """Detect arm side from topic name or message content (strict match)."""
+        if self.arm_side:
+            return self.arm_side
+
+        # Prefer topic when available
+        if topic:
+            topic_l = topic.lower()
+            if "/left/" in topic_l or "left" in topic_l:
+                return "left"
+            if "/right/" in topic_l or "right" in topic_l:
+                return "right"
+
+        # Helper: token-based match to avoid false positives
+        def _tokens(s: str) -> set:
+            import re
+            return set([t for t in re.split(r"[^a-z0-9]+", s.lower()) if t])
+
+        if msg is not None:
+            # JointState name list
+            if hasattr(msg, "name") and msg.name:
+                name_tokens = set()
+                for n in msg.name:
+                    name_tokens |= _tokens(str(n))
+                if "left" in name_tokens:
+                    return "left"
+                if "right" in name_tokens:
+                    return "right"
+            # Header frame_id
+            if hasattr(msg, "header") and hasattr(msg.header, "frame_id"):
+                frame_tokens = _tokens(str(msg.header.frame_id))
+                if "left" in frame_tokens:
+                    return "left"
+                if "right" in frame_tokens:
+                    return "right"
+
+        return "left"  # Default to left
+    
+    def process(self, msg: Any, timestamp: int, topic: str = None) -> Dict[str, Any]:
+        """Process a JointState message."""
+        arm_side = self._detect_arm_side(msg=msg, topic=topic)
+        
         data = {
             'timestamp': timestamp,
             'state': {},
             'action': {}
         }
         
-        # Extract end-effector pose
-        if hasattr(msg, 'eef_pos') and hasattr(msg.eef_pos, 'positions'):
-            eef_positions = msg.eef_pos.positions
-            if len(eef_positions) == 6:
-                data['state']['end_eff'] = np.array(eef_positions[:6], dtype=np.float32)
+        # Extract timestamp from message header if available
+        if hasattr(msg, 'header') and hasattr(msg.header, 'stamp'):
+            stamp = msg.header.stamp
+            if hasattr(stamp, 'sec') and hasattr(stamp, 'nanosec'):
+                data['timestamp'] = stamp.sec * 1_000_000_000 + stamp.nanosec
+        
+        # Extract joint positions (contains joints + gripper)
+        # UR5e actual_joints contains 7 values: 6 joints + 1 gripper
+        if hasattr(msg, 'position') and msg.position is not None and len(msg.position) > 0:
+            try:
+                positions = np.array(msg.position, dtype=np.float32)
+                
+                if len(positions) >= 14:
+                    # First 6 are joints
+                    state_joint_positions = positions[:6]
+                    # 7th is gripper
+                    state_gripper_position = positions[6:7]
 
-        # Extract joint angles
-        if hasattr(msg, 'joints') and hasattr(msg.joints, 'angles'):
-            data['state']['joint_positions'] = np.array(msg.joints.angles, dtype=np.float32)
-            
+                    action_joint_positions = positions[7:13]
+                    action_gripper_position = positions[13:14]
+                    
+                    data['state'][f'{arm_side}_ur5e/joint_positions'] = state_joint_positions
+                    data['state'][f'{arm_side}_ur5e/gripper_position'] = state_gripper_position
+                    data['action'][f'{arm_side}_ur5e/joint_positions'] = action_joint_positions
+                    data['action'][f'{arm_side}_ur5e/gripper_position'] = action_gripper_position
+
+            except Exception as e:
+                # If extraction fails, log the error but continue
+                # This prevents empty data points from being added to streams
+                logging.warning(f"Failed to extract joint positions from {topic}: {e}")
+                pass
+        
+        # Only return data if we have valid state/action data
+        # This prevents empty data points from being added to streams
+        if not data['state'] and not data['action']:
+            return None
+        
         return data
 
     def get_state_action_mapping(self) -> Tuple[List[str], List[str]]:
         """Return the mapping of data fields to state and action."""
-        state_fields = ['end_eff', 'joint_position']
-        action_fields = []
+        # Return generic fields, will be resolved based on arm_side during processing
+        state_fields = [
+            'left_ur5e/joint_positions', 'left_ur5e/gripper_position',
+            'right_ur5e/joint_positions', 'right_ur5e/gripper_position'
+        ]
+        action_fields = [
+            'left_ur5e/joint_positions', 'left_ur5e/gripper_position',
+            'right_ur5e/joint_positions', 'right_ur5e/gripper_position'
+        ]
         return state_fields, action_fields
 
 
-class GripperStateProcessor(MessageProcessor):
-    """Processor for dh_gripper_driver/msg/GripperState messages."""
+class UREEFPoseProcessor(MessageProcessor):
+    """Processor for geometry_msgs/msg/PoseStamped messages from UR5e end-effector.
     
-    def process(self, msg: Any, timestamp: int) -> Dict[str, Any]:
-        """Process a GripperState message."""
+    Extracts end-effector pose (x, y, z, rx, ry, rz) from quaternion.
+    """
+    
+    def __init__(self, arm_side: str = None):
+        """
+        Initialize processor for a specific arm side.
+        
+        Args:
+            arm_side: 'left' or 'right', or None for auto-detection
+        """
+        self.arm_side = arm_side
+    
+    def _detect_arm_side(self, msg: Any = None, topic: str = None) -> str:
+        """Detect arm side from topic name or message content (strict match)."""
+        if self.arm_side:
+            return self.arm_side
+
+        if topic:
+            topic_l = topic.lower()
+            if "/left/" in topic_l or "left" in topic_l:
+                return "left"
+            if "/right/" in topic_l or "right" in topic_l:
+                return "right"
+
+        def _tokens(s: str) -> set:
+            import re
+            return set([t for t in re.split(r"[^a-z0-9]+", s.lower()) if t])
+
+        if msg is not None and hasattr(msg, "header") and hasattr(msg.header, "frame_id"):
+            frame_tokens = _tokens(str(msg.header.frame_id))
+            if "left" in frame_tokens:
+                return "left"
+            if "right" in frame_tokens:
+                return "right"
+
+        return "left"  # Default to left
+    
+    def process(self, msg: Any, timestamp: int, topic: str = None) -> Dict[str, Any]:
+        """Process a PoseStamped message."""
+        arm_side = self._detect_arm_side(msg=msg, topic=topic)
+        
         data = {
             'timestamp': timestamp,
             'state': {},
             'action': {}
         }
         
-        # State information
-        if hasattr(msg, 'position'):
-            data['state']['gripper_position'] = float(msg.position)
-
-        # Action information
-        if hasattr(msg, 'target_position'):
-            data['action']['gripper_position'] = float(msg.target_position)
-
+        # Extract timestamp from message header if available
+        if hasattr(msg, 'header') and hasattr(msg.header, 'stamp'):
+            stamp = msg.header.stamp
+            if hasattr(stamp, 'sec') and hasattr(stamp, 'nanosec'):
+                data['timestamp'] = stamp.sec * 1_000_000_000 + stamp.nanosec
+        
+        # Extract position (x, y, z)
+        try:
+            if hasattr(msg, 'pose') and hasattr(msg.pose, 'position'):
+                pos = msg.pose.position
+                position = np.array([pos.x, pos.y, pos.z], dtype=np.float32)
+                
+                # Extract orientation and convert quaternion to rotation vector
+                if hasattr(msg.pose, 'orientation'):
+                    orient = msg.pose.orientation
+                    # Convert quaternion (qx, qy, qz, qw) to rotation vector (rx, ry, rz)
+                    rot_vec = self._quaternion_to_euler(orient.x, orient.y, orient.z, orient.w)
+                    
+                    # Combine position and orientation (6D: x, y, z, rx, ry, rz)
+                    eef_pose = np.concatenate([position, rot_vec], dtype=np.float32)
+                    data['state'][f'{arm_side}_ur5e/eef_pose'] = eef_pose
+        except Exception as e:
+            # If extraction fails, return empty data (will be filtered out)
+            pass
+        
+        # Only return data if we have valid state/action data
+        # This prevents empty data points from being added to streams
+        if not data['state'] and not data['action']:
+            return None
+        
         return data
+    
+    def _quaternion_to_euler(self, qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+        """Convert quaternion to rotation vector (rx, ry, rz)."""
+        quat = np.array([qx, qy, qz, qw], dtype=np.float64)
+        r = R.from_quat(quat)       # 四元数 -> 旋转
+        rot_vec = r.as_rotvec()     # 旋转 -> 旋转向量 [rx, ry, rz]
+        return rot_vec.astype(np.float32)
 
     def get_state_action_mapping(self) -> Tuple[List[str], List[str]]:
         """Return the mapping of data fields to state and action."""
-        state_fields = ['gripper_position']
-        action_fields = ['gripper_position']
+        state_fields = ['left_ur5e/eef_pose', 'right_ur5e/eef_pose']
+        action_fields = ['left_ur5e/eef_pose', 'right_ur5e/eef_pose']
         return state_fields, action_fields
 
 
@@ -232,15 +375,20 @@ def get_message_processors() -> Dict[str, MessageProcessor]:
     Factory function to create and return message processors.
     
     Returns:
-        Dictionary mapping message type names to processor instances
+        Dictionary mapping message type names or topic patterns to processor instances
     """
     processors = {
         # Config provider (REQUIRED - provides configuration)
         'ConfigProvider': ConfigProvider(),
         
-        # Custom processors for UR and Gripper
-        'UrStates': UrStatesProcessor(),
-        'GripperState': GripperStateProcessor(),
+        '/left/ur5e/actual_joints': URJointStateProcessor('left'),
+        '/right/ur5e/actual_joints': URJointStateProcessor('right'),
+
+        '/left/ur5e/actual_tcp_pose': UREEFPoseProcessor('left'),
+        '/right/ur5e/actual_tcp_pose': UREEFPoseProcessor('right'),
+
+        'JointState': URJointStateProcessor(),  # Will auto-detect from topic
+        'PoseStamped': UREEFPoseProcessor(),    # Will auto-detect from topic
     }
     
     return processors

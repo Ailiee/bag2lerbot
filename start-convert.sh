@@ -13,7 +13,7 @@
 # 3. 将 ROS2 bag 直接转换 LeRobot 
 python /workspace/code/bag2lerbot/ros2_to_lerobot_direct.py \
     --bags-dir /qinglong_datasets/qinglong/raw/${task_id} \
-    --output-dir /qinglong_datasets/qinglong/lerobot/${task_id} \
+    --output-dir /qinglong_datasets/qinglong/lerobot_v30/${task_id} \
     --repo-id ${repo_id} \
     --robot-type qingloongROS2 \
     --task-description "${task_description}" \

@@ -11,6 +11,47 @@ from typing import Dict, List
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+# Names must match the concatenation order in combine_ur_dual_arm_state/action
+STATE_NAMES = [
+    "left_joint_1",
+    "left_joint_2",
+    "left_joint_3",
+    "left_joint_4",
+    "left_joint_5",
+    "left_joint_6",
+    "left_joint_7",
+    "right_joint_1",
+    "right_joint_2",
+    "right_joint_3",
+    "right_joint_4",
+    "right_joint_5",
+    "right_joint_6",
+    "right_joint_7",
+    "left_eef_x",
+    "left_eef_y",
+    "left_eef_z",
+    "left_eef_rx",
+    "left_eef_ry",
+    "left_eef_rz",
+    "right_eef_x",
+    "right_eef_y",
+    "right_eef_z",
+    "right_eef_rx",
+    "right_eef_ry",
+    "right_eef_rz",
+    "waist_x",
+    "waist_y",
+    "waist_z",
+    "neck_pitch",
+    "neck_yaw",
+    "gripper_left",
+    "gripper_right"
+]
+ACTION_NAMES = STATE_NAMES.copy()
+
+# Expected dimensions for this UR dual-arm setup
+STATE_DIM = len(STATE_NAMES)
+ACTION_DIM = len(ACTION_NAMES)
 
 @dataclass
 class StateActionMapping:
@@ -146,17 +187,17 @@ def get_state_action_mapping() -> StateActionMapping:
     # Optional: Define normalization statistics
     # These would typically be computed from your training data
     state_stats = {
-        "mean": np.zeros(33),  # 26-dimensional state
-        "std": np.ones(33),
-        "min": np.full(33, -np.inf),
-        "max": np.full(33, np.inf)
+        "mean": np.zeros(STATE_DIM),  # 26-dimensional state
+        "std": np.ones(STATE_DIM),
+        "min": np.full(STATE_DIM, -np.inf),
+        "max": np.full(STATE_DIM, np.inf)
     }
     
     action_stats = {
-        "mean": np.zeros(33),  # 26-dimensional action
-        "std": np.ones(33),
-        "min": np.full(33, -np.inf),
-        "max": np.full(33, np.inf)
+        "mean": np.zeros(ACTION_DIM),  # 26-dimensional action
+        "std": np.ones(ACTION_DIM),
+        "min": np.full(ACTION_DIM, -np.inf),
+        "max": np.full(ACTION_DIM, np.inf)
     }
     
     return StateActionMapping(

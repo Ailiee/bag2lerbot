@@ -346,6 +346,9 @@ def convert_bag_single_pass(
         config = message_processors['ConfigProvider'].get_converter_config()
         map_mod = load_module_from_path("custom_mapping", mapping_path)
         mapping = map_mod.get_state_action_mapping()
+        state_names = getattr(map_mod, "STATE_NAMES", None)
+        action_names = getattr(map_mod, "ACTION_NAMES", None)
+
         
         # 2. Build topic configuration
         target_topics = set()
@@ -497,7 +500,7 @@ def convert_bag_single_pass(
         for key, state_values in state_data.items():
             if key not in action_data and state_values:
                 action_values = list(state_values)
-                if len(action_values) > 1:
+                if len(action_values) > 1:  # 保留这个检查！
                     action_values.pop(0)
                     action_values.append(action_values[-1])
                 action_data[key] = action_values
@@ -558,8 +561,8 @@ def convert_bag_single_pass(
         a0 = np.asarray(mapping.action_combine_fn(a0_dict), dtype=np.float32)
         
         features = {
-            "observation.state": {"dtype": "float32", "shape": s0.shape, "names": None},
-            "action": {"dtype": "float32", "shape": a0.shape, "names": None},
+            "observation.state": {"dtype": "float32", "shape": s0.shape, "names": state_names},
+            "action": {"dtype": "float32", "shape": a0.shape, "names": action_names},
         }
         
         for cam in config.cameras:
